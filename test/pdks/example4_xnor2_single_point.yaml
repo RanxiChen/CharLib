@@ -1,0 +1,30 @@
+# Smallest YAML-only reproduction of the largest archived example4 difference.
+#
+# Archived target:
+#   cell:         gf180mcu_osu_sc_gp9t3v3__xnor2_1
+#   path/table:   A -> Y / cell_rise
+#   data slew:    3.7140 ns
+#   load:         0.0616 pF
+#   SG2042:       0.635476 ns
+#   Ubuntu 20:    1.69469 ns
+#
+# CharLib still derives all valid A/B transition paths for this cell. Selecting
+# only A -> Y / cell_rise would require procedure-level filtering or source
+# instrumentation, so one cell and one slew/load point is the minimum clean
+# reproduction expressible through the YAML interface.
+settings:
+    # Use a distinct result name to prevent an old full-example Liberty from
+    # being mistaken for this run's output.
+    lib_name: gf180mcu_osu_sc_9t_xnor2_single_point
+    cell_defaults:
+        netlist: gf180mcu/spice/osu_sc_9t.spice
+        models:
+            - gf180mcu/models/sm141064.spice typical
+            - gf180mcu/models/design.spice
+        data_slews: [3.7140]
+        loads:      [0.0616]
+cells:
+    gf180mcu_osu_sc_gp9t3v3__xnor2_1:
+        inputs: [A, B]
+        outputs: ['Y']
+        functions: [Y=!(A^B)]
