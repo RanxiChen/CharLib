@@ -202,15 +202,16 @@ class LookupTable(liberty.Group):
             merged_index_values.append(np.array(sorted([*merged])))
             merged_template_variables[variable] = len(merged)
 
-        # Merge LUT table values, always preferring nonzeros
+        # Merge LUT table values, always preferring nonzeros; take maximum on collision
         values = [(index_values, self[*index_values]) for index_values in itertools.product(*self.index_values)]
         values += [(index_values, other[*index_values]) for index_values in itertools.product(*other.index_values)]
         merged_values = np.zeros(tuple(merged_template_variables.values()))
         self.template.variables = merged_template_variables
         self.index_values = merged_index_values
         for (index_values, value) in values:
-            if not merged_values[*self._get_indices(*index_values)]:
-                merged_values[*self._get_indices(*index_values)] = value
+            slot = self._get_indices(*index_values)
+            if value:
+                merged_values[*slot] = max(merged_values[*slot], value)
         self.values = merged_values
 
 
