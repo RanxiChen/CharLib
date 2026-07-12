@@ -1,5 +1,6 @@
 """Dispatches characterization jobs and manages cell data"""
 
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from tqdm import tqdm
@@ -21,6 +22,21 @@ import charlib.characterizer.procedures.sequential.constraint.metastability.c2q_
 import charlib.characterizer.procedures.sequential.constraint.recovery
 import charlib.characterizer.procedures.sequential.constraint.removal
 import charlib.characterizer.procedures.sequential.constraint.min_pulse_width
+
+def _worker_prewarm(backend: str) -> None:
+    """Pre-initialize PySpice Simulator factory in a worker process.
+
+    Called as a ProcessPoolExecutor initializer to pay the first-call
+    PySpice/ngspice factory cost before any real task reaches the worker.
+    Silently ignores failures so the pool can still start when PySpice
+    or the simulator backend is unavailable.
+    """
+    try:
+        import PySpice
+        PySpice.Simulator.factory(simulator=backend)
+    except Exception:
+        pass
+
 
 class Characterizer:
     """Main object of Charlib. Keeps track of settings and cells, and schedules simulations."""
@@ -85,7 +101,11 @@ class Characterizer:
         # Run all simulation jobs and merge each resulting liberty cell group into the library
         with tqdm(bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                   total=len(simulation_tasks), desc="Characterizing") as progress_bar:
-            with ProcessPoolExecutor(max_workers=self.settings.jobs) as executor:
+            executor_kwargs = {'max_workers': self.settings.jobs}
+            if self.settings.simulation.prewarm_workers:
+                executor_kwargs['initializer'] = _worker_prewarm
+                executor_kwargs['initargs'] = (self.settings.simulation.backend,)
+            with ProcessPoolExecutor(**executor_kwargs) as executor:
                 futures = [executor.submit(task, *args) for (task, *args) in simulation_tasks]
                 for future in as_completed(futures):
                     try:
@@ -186,6 +206,8 @@ class SimulationSettings:
     """Container for simulation backend and procedures"""
     def __init__(self, **kwargs):
         self.backend = kwargs.get('backend', 'ngspice-shared')
+        self.prewarm_workers = kwargs.get('prewarm_workers',
+            os.environ.get('CHARLIB_PREWARM_WORKERS', '1') == '1')
         self.input_capacitance = registered_procedures[
             kwargs.get('input_capacitance_procedure', 'ac_sweep')
         ]['callable']

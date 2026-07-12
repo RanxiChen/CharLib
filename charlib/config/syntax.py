@@ -221,6 +221,16 @@ class ConfigFile:
             ) : Or('ngspice-shared', 'ngspice-subprocess', 'xyce-serial', 'xyce-parallel'),
             Optional(
                 Literal(
+                    'prewarm_workers',
+                    description='Pre-initialize the PySpice/ngspice factory in each worker ' \
+                                'process before dispatching real tasks. When enabled (default), ' \
+                                'the first-call overhead is paid during pool startup instead of ' \
+                                'inside the first measurement. Set to false to disable. Can also ' \
+                                'be controlled via the CHARLIB_PREWARM_WORKERS environment variable.'
+                ), default=True
+            ) : bool,
+            Optional(
+                Literal(
                     'input_capacitance_procedure',
                     description='The name of a procedure used to measure the capacitance of ' \
                                 'each input pin for each cell.' # TODO: Refer to docs for procedures
