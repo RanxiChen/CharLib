@@ -13,6 +13,8 @@ def combinational_worst_case(cell, config, settings):
     """Measure worst-case combinational transient and propagation delays"""
     for variation in config.variations('data_slews', 'loads', 'transient_sim_end_time'):
         for path in cell.paths():
+            if not any(cell.nonmasking_conditions_for_path(*path)):
+                continue
             yield (measure_delays_for_path_with_criterion, cell, config, settings, variation, path, max)
 
 @register('data_slews', 'loads', 'transient_sim_end_time')
@@ -20,6 +22,8 @@ def combinational_average(cell, config, settings):
     """Measure combinational transient and propagation delays using a uniform average"""
     for variation in config.variations('data_slews', 'loads', 'transient_sim_end_time'):
         for path in cell.paths():
+            if not any(cell.nonmasking_conditions_for_path(*path)):
+                continue
             yield (measure_delays_for_path_with_criterion, cell, config, settings, variation, path, average)
 
 def measure_delays_for_path_with_criterion(cell, config, settings, variation, path, criterion=max):
