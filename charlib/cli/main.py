@@ -45,6 +45,9 @@ def main():
     parser_characterize.add_argument(
         '-f', '--filters', nargs='*',
         help='A list of one or more regex strings. charlib will only characterize cells matching one or more of the filters.')
+    parser_characterize.add_argument(
+        "--metrics", type=str, default="",
+        help="Write instrumentation metrics to the specified JSON file")
     parser_characterize.set_defaults(func=run.run)
 
     # Set up charlib compare arguments

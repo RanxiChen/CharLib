@@ -1,7 +1,5 @@
 """Plotting utilities for characterization results"""
 
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import numpy as np
 
 
@@ -21,6 +19,7 @@ def plot_io_voltages(analyses, input_signals, output_signals, legend_labels,
     :param indicate_voltages: Key voltage values to be indicated as horizontal lines on each ax.
     :param indicate_times: Key time values to be indicated as vertical lines on each ax.
     """
+    import matplotlib.pyplot as plt
     signals = input_signals + output_signals
     ratios = [1]*len(input_signals) + [len(input_signals)]*len(output_signals)
     figure, axs = plt.subplots(nrows=len(signals), sharex=True, height_ratios=ratios,
@@ -47,6 +46,8 @@ def plot_delay_surfaces(lut_groups, fig_label='', title='Cell Delays'):
 
     :param lut_groups: A list of liberty.LookupTable groups containing delay data.
     """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
     figure, ax = plt.subplots(label=fig_label, subplot_kw={'projection': '3d'})
     ax.set(
         xlabel=list(lut_groups[0].template.variables.keys())[0],
@@ -70,6 +71,7 @@ def plot_contour(settings, points, min_setup, max_hold, max_setup, min_hold,
     :param title: Full plot title string.
     :param knee_point: Optional (setup_val, hold_val) in display time units to highlight.
     """
+    import matplotlib.pyplot as plt
     if debug_path is None:
         return
     debug_path.mkdir(parents=True, exist_ok=True)

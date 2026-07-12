@@ -209,8 +209,9 @@ class LookupTable(liberty.Group):
         self.template.variables = merged_template_variables
         self.index_values = merged_index_values
         for (index_values, value) in values:
-            if not merged_values[*self._get_indices(*index_values)]:
-                merged_values[*self._get_indices(*index_values)] = value
+            slot = self._get_indices(*index_values)
+            if value:
+                merged_values[*slot] = max(merged_values[*slot], value)
         self.values = merged_values
 
 

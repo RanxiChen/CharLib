@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import json
 from pathlib import Path
 from PySpice.Logging import Logging
 
@@ -14,14 +15,14 @@ def run(args):
     library_dir = args.library
     config = utils.find_config(library_dir)
     if not config:
-        raise ValueError(f'Unable to locate a YAML file containing configuration settings in ' \
-                         f'{library_dir} or its subdirectories.')
+        raise ValueError(f"Unable to locate a YAML file containing configuration settings in " \
+                         f"{library_dir} or its subdirectories.")
 
     # Read in library settings
-    settings = config['settings']
-    cells = config['cells']
+    settings = config["settings"]
+    cells = config["cells"]
     characterizer = Characterizer(**settings)
-    logger = Logging.setup_logging(logging_level='ERROR') # FIXME: logging level should be configurable
+    logger = Logging.setup_logging(logging_level="ERROR") # FIXME: logging level should be configurable
 
     # Override settings with relevant command line flags
     characterizer.settings.debug = characterizer.settings.debug or args.debug
@@ -38,6 +39,11 @@ def run(args):
     # Characterize
     liberty = characterizer.characterize()
 
+    # Write metrics if requested
+    if args.metrics:
+        with open(args.metrics, "w") as f:
+            json.dump(characterizer.metrics, f, indent=2)
+
     # Write to file
     if args.output:
         libfile = Path(args.output)
@@ -46,10 +52,10 @@ def run(args):
     else:
         libfile = characterizer.settings.results_dir / characterizer.library.file_name
     libfile.parent.mkdir(parents=True, exist_ok=True)
-    with open(libfile, 'w') as f:
+    with open(libfile, "w") as f:
         f.write(str(liberty))
         if not characterizer.settings.quiet:
-             print(f'Results written to {str(libfile.resolve())}')
+             print(f"Results written to {str(libfile.resolve())}")
 
     # Run any post-characterization analysis
     if args.comparewith:
