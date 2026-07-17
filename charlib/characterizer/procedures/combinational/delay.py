@@ -1,6 +1,7 @@
 import PySpice
 import matplotlib.pyplot as plt
 import hashlib
+import random
 import time
 from numpy import average
 
@@ -12,7 +13,7 @@ from charlib.liberty.library import LookupTable
 
 
 def plan_points(cell, config, settings, variation, path, criterion):
-    """Generate SimulationPoints for one (variation, path, criterion) combination."""
+    """Generate SimulationPoint for one (variation, path, criterion) combination."""
     from charlib.characterizer.reusable_engine import SimulationPoint
 
     points = []
@@ -123,9 +124,61 @@ def execute_point_fresh(point, *, cell=None, config=None, settings=None, variati
         )
 
 
+def reduce_condition_results(results, criterion):
+    """Apply criterion across nonmasking conditions per measurement name."""
+    if not results:
+        return {}
+    from collections import defaultdict
+    by_name = defaultdict(list)
+    for r in results:
+        if r.status != 'ok':
+            continue
+        for name, value in r.measurement.items():
+            by_name[name].append(value)
+    reduced = {}
+    for name, values in by_name.items():
+        reduced[name] = criterion(values)
+    return reduced
+
+
+def assemble_delay_liberty(cell, config, settings, variation, path, reduced_measurements):
+    """Build Liberty groups from reduced measurement values.
+
+    Uses the same LookupTable construction as the legacy path.
+    """
+    import PySpice
+    from charlib.liberty.library import LookupTable
+
+    input_pin = path[0].name
+    output_pin = path[1].name
+    data_slew = float(variation['data_slews'] * settings.units.time)
+    load = float(variation['loads'] * settings.units.capacitance)
+
+    result = cell.liberty
+    result.group('pin', output_pin).add_group('timing', f'/* {input_pin} */')
+    result.group('pin', output_pin).group('timing', f'/* {input_pin} */').add_attribute('related_pin', input_pin)
+
+    for name in sorted(reduced_measurements.keys()):
+        delay_val = reduced_measurements[name]
+        delay = delay_val * PySpice.Unit.u_s
+
+        lut_name, meas_path = name.split('__')
+        lut_template_size = f'{len(config.parameters["loads"])}x{len(config.parameters["data_slews"])}'
+        lut = LookupTable(lut_name, f'delay_template_{lut_template_size}',
+                          total_output_net_capacitance=[load.convert(settings.units.capacitance.prefixed_unit).value],
+                          input_net_transition=[data_slew.convert(settings.units.time.prefixed_unit).value])
+        lut.values[0,0] = delay.convert(settings.units.time.prefixed_unit).value
+        result.group('pin', output_pin).group('timing', f'/* {input_pin} */').add_group(lut)
+
+    return result
+
+
 @register('data_slews', 'loads', 'transient_sim_end_time')
 def combinational_worst_case(cell, config, settings):
     """Measure worst-case combinational transient and propagation delays"""
+    use_ir = getattr(settings, 'execution_engine', 'legacy') == 'reusable_fresh'
+    if use_ir:
+        return [(_combinational_ir_flow, cell, config, settings, max)]
     for variation in config.variations('data_slews', 'loads', 'transient_sim_end_time'):
         for path in cell.paths():
             yield (measure_delays_for_path_with_criterion, cell, config, settings, variation, path, max)
@@ -134,9 +187,28 @@ def combinational_worst_case(cell, config, settings):
 @register('data_slews', 'loads', 'transient_sim_end_time')
 def combinational_average(cell, config, settings):
     """Measure combinational transient and propagation delays using a uniform average"""
+    use_ir = getattr(settings, 'execution_engine', 'legacy') == 'reusable_fresh'
+    if use_ir:
+        return [(_combinational_ir_flow, cell, config, settings, average)]
     for variation in config.variations('data_slews', 'loads', 'transient_sim_end_time'):
         for path in cell.paths():
             yield (measure_delays_for_path_with_criterion, cell, config, settings, variation, path, average)
+
+
+def _combinational_ir_flow(cell, config, settings, criterion=max):
+    """IR-based combinational delay measurement flow.
+
+    Plans points, executes fresh, reduces, assembles.
+    """
+    for variation in config.variations('data_slews', 'loads', 'transient_sim_end_time'):
+        for path in cell.paths():
+            points = plan_points(cell, config, settings, variation, path, criterion)
+            random.shuffle(points)
+            results = [execute_point_fresh(p, cell=cell, config=config, settings=settings,
+                                           variation=variation, path=path) for p in points]
+            reduced = reduce_condition_results(results, criterion)
+            assemble_delay_liberty(cell, config, settings, variation, path, reduced)
+    return cell.liberty
 
 
 def _run_single_condition(cell, config, settings, variation, path, state_map,
