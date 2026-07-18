@@ -2,6 +2,7 @@ import os
 import operator
 import time
 import json
+import signal
 import tempfile
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
@@ -290,7 +291,7 @@ class TestOmitOnFailure:
     def _make_results(self):
         return [
             TaskResult(task_id=0, value=Group('cell', 'a')),
-            TaskResult(task_id=1, error_type='ValueError', error_message='bad'),
+            TaskResult(task_id=1, error_type='ValueError', error_message='bad', exception=ValueError('bad')),
             TaskResult(task_id=2, value=Group('cell', 'c')),
         ]
 
@@ -303,7 +304,7 @@ class TestOmitOnFailure:
 
     def test_omit_false_raises(self):
         c = Characterizer(lib_name='test')
-        with pytest.raises(RuntimeError, match="Task 1 failed"):
+        with pytest.raises(ValueError, match='bad'):
             c._apply_batched_results(self._make_results(), records=[None, None, None], omit_on_failure=False)
 
     def test_siblings_survive(self):
@@ -367,3 +368,80 @@ class TestMetricsSeparation:
             assert data['batch_count'] == 0
             assert 'task_count' not in liberty
             assert 'batch_count' not in liberty
+
+
+class TestExceptionPropagation:
+    def test_execute_batch_captures_exception_object(self):
+        record = TaskRecord(task_id=5, callable=dummy_fail, args=(7,), procedure="t", cost_hint=1.0)
+        batch = BatchRecord(batch_id=0, tasks=[record], predicted_cost=1.0)
+        result = execute_batch(batch)
+        assert result.task_results[0].exception is not None
+        assert isinstance(result.task_results[0].exception, ValueError)
+        assert "bad input: 7" in str(result.task_results[0].exception)
+
+    def test_apply_batched_results_re_raises_original(self):
+        c = Characterizer(lib_name='test')
+        exc = ValueError('original')
+        results = [
+            TaskResult(task_id=0, value=Group('cell', 'a')),
+            TaskResult(task_id=1, error_type='ValueError', error_message='original', exception=exc),
+            TaskResult(task_id=2, value=Group('cell', 'c')),
+        ]
+        with pytest.raises(ValueError, match='original') as exc_info:
+            c._apply_batched_results(results, records=[None, None, None], omit_on_failure=False)
+        assert exc_info.value is exc
+
+
+class TestSignalInterruption:
+    def test_batched_runs_in_non_main_thread(self):
+        # Verify the SIGTERM handler guard allows _characterize_batched to run in a
+        # non-main thread without failing on signal.signal.
+        import threading
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'}, jobs=2)
+        records = [
+            TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.01), procedure="t", cost_hint=1.0)
+            for i in range(4)
+        ]
+        from charlib.characterizer.characterizer import SchedulerMetrics
+        metrics = SchedulerMetrics(task_count=4)
+
+        class _Bar:
+            def update(self, n):
+                pass
+
+        result = []
+
+        def target():
+            c._characterize_batched(records, _Bar(), metrics)
+            result.append(True)
+
+        t = threading.Thread(target=target)
+        t.start()
+        t.join(timeout=10)
+        assert not t.is_alive()
+        assert result
+
+
+class TestWorkerScaling:
+    def _run_batched(self, jobs):
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'}, jobs=jobs)
+        records = [
+            TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.01), procedure="t", cost_hint=1.0)
+            for i in range(4)
+        ]
+        from charlib.characterizer.characterizer import SchedulerMetrics
+        metrics = SchedulerMetrics(task_count=4)
+
+        class _Bar:
+            def update(self, n):
+                pass
+
+        c._characterize_batched(records, _Bar(), metrics)
+        cells = list(c.library.subgroups_with_name('cell'))
+        return sorted(g.identifier for g in cells)
+
+    def test_j1_equals_j8(self):
+        identifiers_j1 = self._run_batched(1)
+        identifiers_j8 = self._run_batched(8)
+        assert identifiers_j1 == ['cell_0', 'cell_1', 'cell_2', 'cell_3']
+        assert identifiers_j8 == identifiers_j1

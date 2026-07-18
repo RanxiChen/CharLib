@@ -111,6 +111,8 @@ class Characterizer:
             # Fail on first error
             for r in all_results:
                 if r.error_type is not None:
+                    if r.exception is not None:
+                        raise r.exception
                     raise RuntimeError(
                         f"Task {r.task_id} failed: {r.error_type}: {r.error_message}"
                     )
@@ -144,7 +146,8 @@ class Characterizer:
             interrupted = True
             raise KeyboardInterrupt()
 
-        if hasattr(signal, 'SIGTERM'):
+        import threading
+        if threading.current_thread() is threading.main_thread() and hasattr(signal, 'SIGTERM'):
             old_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
 
         executor = None
@@ -202,7 +205,21 @@ class Characterizer:
             metrics.collect_seconds = time.perf_counter() - collect_start
         finally:
             if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=True)
+                if interrupted:
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
+                    # Ensure child processes are terminated
+                    import multiprocessing
+                    for child in multiprocessing.active_children():
+                        try:
+                            child.terminate()
+                            child.join(timeout=1.0)
+                        except Exception:
+                            pass
+                else:
+                    executor.shutdown(wait=True, cancel_futures=True)
             if old_sigterm is not None:
                 try:
                     signal.signal(signal.SIGTERM, old_sigterm)

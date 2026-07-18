@@ -30,6 +30,7 @@ class TaskResult:
     value: Any = None
     error_type: Optional[str] = None
     error_message: Optional[str] = None
+    exception: Optional[Exception] = None
     metrics: Optional['SchedulerMetrics'] = None
 
 
@@ -97,7 +98,8 @@ def execute_batch(batch: BatchRecord) -> BatchResult:
             results.append(TaskResult(
                 task_id=record.task_id,
                 error_type=type(e).__name__,
-                error_message=str(e)
+                error_message=str(e),
+                exception=e
             ))
     wall = _time.perf_counter() - t0
     return BatchResult(batch_id=batch.batch_id, task_results=results, worker_pid=pid, wall_seconds=wall)
