@@ -329,16 +329,14 @@ class Characterizer:
 
         if legacy_tasks:
             from charlib.characterizer.procedures import ProcedureFailedException
-            with ProcessPoolExecutor(max_workers=self.settings.jobs) as executor:
-                futures = {executor.submit(t[0], *t[1:]): i for i, t in enumerate(legacy_tasks)}
-                for future in as_completed(futures):
-                    try:
-                        cell_group = future.result()
-                        self.library.add_group(cell_group)
-                    except ProcedureFailedException:
-                        if self.settings.omit_on_failure:
-                            continue
-                        raise
+            for task_callable, *task_args in legacy_tasks:
+                try:
+                    cell_group = task_callable(*task_args)
+                    self.library.add_group(cell_group)
+                except ProcedureFailedException:
+                    if self.settings.omit_on_failure:
+                        continue
+                    raise
 
         # Post-processing: Fetch generated table templates and add them to the library
         lut_templates = []
