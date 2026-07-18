@@ -1,5 +1,6 @@
 """Scheduler data structures and instrumentation for CharLib characterization tasks."""
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -42,3 +43,61 @@ class SchedulerMetrics:
     collect_seconds: float = 0.0
     merge_seconds: float = 0.0
     ipc_estimate_bytes: int = 0
+
+
+@dataclass
+class BatchRecord:
+    """A group of tasks to be executed together by one worker."""
+    batch_id: int
+    tasks: list
+    predicted_cost: float
+
+
+@dataclass
+class BatchResult:
+    """Result of executing a batch."""
+    batch_id: int
+    task_results: list
+    worker_pid: int
+    wall_seconds: float
+
+
+def plan_batches(tasks: list, workers: int, batch_factor: int = 4) -> list:
+    """Partition tasks into batches using cost-ordered LPT assignment."""
+    n = len(tasks)
+    if n == 0:
+        return []
+    min_batches = min(2 * workers, n)
+    max_batches = min(4 * workers, n)
+    target = max(min_batches, min(max_batches, batch_factor * workers))
+    target = min(target, n)
+    sorted_tasks = sorted(tasks, key=lambda t: (-t.cost_hint, t.task_id))
+    batches = [BatchRecord(batch_id=i, tasks=[], predicted_cost=0.0) for i in range(target)]
+    for task in sorted_tasks:
+        lightest = min(batches, key=lambda b: (b.predicted_cost, b.batch_id))
+        lightest.tasks.append(task)
+        lightest.predicted_cost += task.cost_hint
+    batches = [b for b in batches if b.tasks]
+    for i, b in enumerate(batches):
+        b.batch_id = i
+    return batches
+
+
+def execute_batch(batch: BatchRecord) -> BatchResult:
+    """Execute all tasks in a batch sequentially. No nested pools/threads."""
+    import time as _time
+    pid = os.getpid()
+    t0 = _time.perf_counter()
+    results = []
+    for record in batch.tasks:
+        try:
+            value = record.callable(*record.args)
+            results.append(TaskResult(task_id=record.task_id, value=value))
+        except Exception as e:
+            results.append(TaskResult(
+                task_id=record.task_id,
+                error_type=type(e).__name__,
+                error_message=str(e)
+            ))
+    wall = _time.perf_counter() - t0
+    return BatchResult(batch_id=batch.batch_id, task_results=results, worker_pid=pid, wall_seconds=wall)

@@ -1,18 +1,18 @@
 """Dispatches characterization jobs and manages cell data"""
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from pathlib import Path
 from tqdm import tqdm
-
 import matplotlib.pyplot as plt
 import time
+import os
 
 from charlib.characterizer import utils, plots
 from charlib.characterizer.cell import Cell, CellTestConfig
 from charlib.characterizer.units import UnitsSettings
 from charlib.characterizer.procedures import registered_procedures, ProcedureFailedException
 from charlib.liberty.library import Library
-from charlib.characterizer.scheduler import TaskRecord, TaskResult, SchedulerMetrics
+from charlib.characterizer.scheduler import TaskRecord, TaskResult, SchedulerMetrics, plan_batches, execute_batch
 
 import charlib.characterizer.procedures.pin_capacitance.ac_sweep
 import charlib.characterizer.procedures.pin_capacitance.charge_integration
@@ -24,6 +24,7 @@ import charlib.characterizer.procedures.sequential.constraint.metastability.c2q_
 import charlib.characterizer.procedures.sequential.constraint.recovery
 import charlib.characterizer.procedures.sequential.constraint.removal
 import charlib.characterizer.procedures.sequential.constraint.min_pulse_width
+
 
 class Characterizer:
     """Main object of Charlib. Keeps track of settings and cells, and schedules simulations."""
@@ -78,6 +79,68 @@ class Characterizer:
             simulations += self.settings.simulation.combinational_leakage(cell, config, self.settings)
         return simulations
 
+    def _characterize_batched(self, records, progress_bar, metrics):
+        """Execute TaskRecords using cost-ordered micro-batches.
+
+        Activated when the environment variable ``CHARLIB_S2_BATCHED`` is set to ``1``.
+        """
+        workers = self.settings.jobs or os.cpu_count() or 4
+        batch_factor = 4
+
+        submit_start = time.perf_counter()
+        batches = plan_batches(records, workers, batch_factor=batch_factor)
+        metrics.batch_count = len(batches)
+        metrics.future_count = len(batches)
+
+        future_to_batch = {}
+        pending = set()
+        all_results = []
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            # Seed the pool with up to 2*workers batches
+            max_in_flight = max(1, 2 * workers)
+            batch_iter = iter(batches)
+            for _ in range(min(len(batches), max_in_flight)):
+                try:
+                    batch = next(batch_iter)
+                except StopIteration:
+                    break
+                fut = executor.submit(execute_batch, batch)
+                future_to_batch[fut] = batch
+                pending.add(fut)
+
+            metrics.submit_seconds = time.perf_counter() - submit_start
+            collect_start = time.perf_counter()
+
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    batch = future_to_batch.pop(fut)
+                    batch_result = fut.result()
+                    all_results.extend(batch_result.task_results)
+                    progress_bar.update(len(batch.tasks))
+                # Keep the pipeline full
+                while len(pending) < max_in_flight:
+                    try:
+                        batch = next(batch_iter)
+                    except StopIteration:
+                        break
+                    fut = executor.submit(execute_batch, batch)
+                    future_to_batch[fut] = batch
+                    pending.add(fut)
+
+            metrics.collect_seconds = time.perf_counter() - collect_start
+
+        all_results.sort(key=lambda r: r.task_id)
+        for result in all_results:
+            if result.error_type is not None:
+                if self.settings.omit_on_failure and result.error_type == ProcedureFailedException.__name__:
+                    continue
+                raise Exception(result.error_message)
+            merge_start = time.perf_counter()
+            self.library.add_group(result.value)
+            metrics.merge_seconds += time.perf_counter() - merge_start
+
     def characterize(self):
         """Execute scheduled simulation jobs in parallel"""
         # Setup: Prepare simulation jobs single-threadedly (is that a word?)
@@ -100,30 +163,33 @@ class Characterizer:
         # Run all simulation jobs and merge each resulting liberty cell group into the library
         with tqdm(bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                   total=len(simulation_tasks), desc="Characterizing") as progress_bar:
-            with ProcessPoolExecutor(max_workers=self.settings.jobs) as executor:
-                submit_start = time.perf_counter()
-                futures = [executor.submit(record.callable, *record.args) for record in records]
-                future_to_record = {future: record for future, record in zip(futures, records)}
-                metrics.submit_seconds = time.perf_counter() - submit_start
+            if os.environ.get('CHARLIB_S2_BATCHED') == '1':
+                self._characterize_batched(records, progress_bar, metrics)
+            else:
+                with ProcessPoolExecutor(max_workers=self.settings.jobs) as executor:
+                    submit_start = time.perf_counter()
+                    futures = [executor.submit(record.callable, *record.args) for record in records]
+                    future_to_record = {future: record for future, record in zip(futures, records)}
+                    metrics.submit_seconds = time.perf_counter() - submit_start
 
-                for future in as_completed(futures):
-                    record = future_to_record[future]
-                    try:
-                        value = future.result()
-                        result = TaskResult(task_id=record.task_id, value=value)
-                    except Exception as e:
-                        result = TaskResult(
-                            task_id=record.task_id,
-                            error_type=type(e).__name__,
-                            error_message=str(e),
-                        )
-                        if self.settings.omit_on_failure and isinstance(e, ProcedureFailedException):
-                            continue
-                        raise
-                    merge_start = time.perf_counter()
-                    self.library.add_group(result.value)
-                    metrics.merge_seconds += time.perf_counter() - merge_start
-                    progress_bar.update(1)
+                    for future in as_completed(futures):
+                        record = future_to_record[future]
+                        try:
+                            value = future.result()
+                            result = TaskResult(task_id=record.task_id, value=value)
+                        except Exception as e:
+                            result = TaskResult(
+                                task_id=record.task_id,
+                                error_type=type(e).__name__,
+                                error_message=str(e),
+                            )
+                            if self.settings.omit_on_failure and isinstance(e, ProcedureFailedException):
+                                continue
+                            raise
+                        merge_start = time.perf_counter()
+                        self.library.add_group(result.value)
+                        metrics.merge_seconds += time.perf_counter() - merge_start
+                        progress_bar.update(1)
 
         # Post-processing: Fetch generated table templates and add them to the library
         lut_templates = []
@@ -209,6 +275,7 @@ class CharacterizationSettings:
             'output_threshold_pct_fall': self.logic_thresholds.falling,
         }
 
+
 class SimulationSettings:
     """Container for simulation backend and procedures"""
     def __init__(self, **kwargs):
@@ -238,6 +305,7 @@ class SimulationSettings:
             kwargs.get('min_pulse_width_constraint_procedure', 'min_pulse_width_constraint')
         ]['callable']
 
+
 class LogicThresholds:
     """Container for logic_thresholds settings"""
     def __init__(self, **kwargs):
@@ -245,6 +313,7 @@ class LogicThresholds:
         self.high = kwargs.get('high', 0.8)
         self.rising = kwargs.get('rising', 0.5)
         self.falling = kwargs.get('falling', 0.5)
+
 
 class NamedNode:
     """Binds supply node names to voltages"""
