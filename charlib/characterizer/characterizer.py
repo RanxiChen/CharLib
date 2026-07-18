@@ -135,6 +135,8 @@ class CharacterizationSettings:
         self.quiet = kwargs.pop('quiet', False)
         self.cell_defaults = kwargs.get('cell_defaults', {})
         self.omit_on_failure = kwargs.get('omit_on_failure', False)
+        self.execution_engine = kwargs.get('execution_engine',
+                                           kwargs.get('simulation', {}).get('execution_engine', 'legacy'))
 
         # Simulation procedures
         self.simulation = SimulationSettings(**kwargs.get('simulation', {}))
@@ -186,6 +188,7 @@ class SimulationSettings:
     """Container for simulation backend and procedures"""
     def __init__(self, **kwargs):
         self.backend = kwargs.get('backend', 'ngspice-shared')
+        self.execution_engine = kwargs.get('execution_engine', 'legacy')
         self.input_capacitance = registered_procedures[
             kwargs.get('input_capacitance_procedure', 'ac_sweep')
         ]['callable']

@@ -19,9 +19,9 @@ def plan_points(cell, config, settings, variation, path, criterion):
     points = []
     data_slew = float(variation['data_slews'] * settings.units.time)
     load = float(variation['loads'] * settings.units.capacitance)
-    t_sim_end = float(variation['transient_sim_end_time'] * settings.units.time)
+    t_sim_end = max(float(variation['transient_sim_end_time'] * settings.units.time), 1000*data_slew)
     input_pin = path[0]
-    output_pin = path[1]
+    output_pin = path[2]
 
     for pin_states in cell.nonmasking_conditions_for_path(*path):
         pin_map = utils.PinStateMap(cell.inputs, cell.outputs, pin_states)
@@ -103,6 +103,8 @@ def execute_point_fresh(point, *, cell=None, config=None, settings=None, variati
             backend=settings.simulation.backend,
             temperature=point.temperature,
             supplies_hash=hashlib.md5(str(point.supplies).encode()).hexdigest()[:16],
+            data_slew=float(data_slew),
+            t_sim_end=float(t_sim_end),
         )
 
         return MeasurementResult(
@@ -149,10 +151,10 @@ def assemble_delay_liberty(cell, config, settings, variation, path, reduced_meas
     import PySpice
     from charlib.liberty.library import LookupTable
 
-    input_pin = path[0].name
-    output_pin = path[1].name
-    data_slew = float(variation['data_slews'] * settings.units.time)
-    load = float(variation['loads'] * settings.units.capacitance)
+    input_pin = path[0].name if hasattr(path[0], 'name') else path[0]
+    output_pin = path[2].name if hasattr(path[2], 'name') else path[2]
+    data_slew = variation['data_slews'] * settings.units.time
+    load = variation['loads'] * settings.units.capacitance
 
     result = cell.liberty
     result.group('pin', output_pin).add_group('timing', f'/* {input_pin} */')
@@ -160,7 +162,7 @@ def assemble_delay_liberty(cell, config, settings, variation, path, reduced_meas
 
     for name in sorted(reduced_measurements.keys()):
         delay_val = reduced_measurements[name]
-        delay = delay_val * PySpice.Unit.u_s
+        delay = delay_val @ PySpice.Unit.u_s
 
         lut_name, meas_path = name.split('__')
         lut_template_size = f'{len(config.parameters["loads"])}x{len(config.parameters["data_slews"])}'
@@ -176,9 +178,10 @@ def assemble_delay_liberty(cell, config, settings, variation, path, reduced_meas
 @register('data_slews', 'loads', 'transient_sim_end_time')
 def combinational_worst_case(cell, config, settings):
     """Measure worst-case combinational transient and propagation delays"""
-    use_ir = getattr(settings, 'execution_engine', 'legacy') == 'reusable_fresh'
+    use_ir = _settings_execution_engine(settings) in ('reusable_fresh', 'reusable_ngspice')
     if use_ir:
-        return [(_combinational_ir_flow, cell, config, settings, max)]
+        yield (_combinational_ir_flow, cell, config, settings, max)
+        return
     for variation in config.variations('data_slews', 'loads', 'transient_sim_end_time'):
         for path in cell.paths():
             yield (measure_delays_for_path_with_criterion, cell, config, settings, variation, path, max)
@@ -187,28 +190,202 @@ def combinational_worst_case(cell, config, settings):
 @register('data_slews', 'loads', 'transient_sim_end_time')
 def combinational_average(cell, config, settings):
     """Measure combinational transient and propagation delays using a uniform average"""
-    use_ir = getattr(settings, 'execution_engine', 'legacy') == 'reusable_fresh'
+    use_ir = _settings_execution_engine(settings) in ('reusable_fresh', 'reusable_ngspice')
     if use_ir:
-        return [(_combinational_ir_flow, cell, config, settings, average)]
+        yield (_combinational_ir_flow, cell, config, settings, average)
+        return
     for variation in config.variations('data_slews', 'loads', 'transient_sim_end_time'):
         for path in cell.paths():
             yield (measure_delays_for_path_with_criterion, cell, config, settings, variation, path, average)
 
 
+def _settings_execution_engine(settings):
+    """Return the requested execution engine, defaulting to legacy behavior."""
+    return getattr(settings, 'execution_engine',
+                   getattr(getattr(settings, 'simulation', None), 'execution_engine', 'legacy'))
+
+
 def _combinational_ir_flow(cell, config, settings, criterion=max):
     """IR-based combinational delay measurement flow.
 
-    Plans points, executes fresh, reduces, assembles.
+    Plans points, executes through the selected IR engine, reduces, assembles.
     """
-    for variation in config.variations('data_slews', 'loads', 'transient_sim_end_time'):
+    execution_engine = _settings_execution_engine(settings)
+    if execution_engine != 'reusable_ngspice':
+        for variation in config.variations('data_slews', 'loads', 'transient_sim_end_time'):
+            for path in cell.paths():
+                points = plan_points(cell, config, settings, variation, path, criterion)
+                random.shuffle(points)
+                results = [execute_point_fresh(p, cell=cell, config=config, settings=settings,
+                                               variation=variation, path=path) for p in points]
+                reduced = reduce_condition_results(results, criterion)
+                assemble_delay_liberty(cell, config, settings, variation, path, reduced)
+        return cell.liberty
+
+    from collections import defaultdict
+    from charlib.characterizer.reusable_engine import WorkerContext, TopologySignature
+
+    ctx = WorkerContext()
+    ledger = {
+        'point_count': 0,
+        'deck_load_count': 0,
+        'fresh_retry_count': 0,
+        'error_count': 0,
+    }
+    setattr(settings, 'reusable_ngspice_ledger', ledger)
+
+    groups = []
+    work_items = []
+    for group_id, variation in enumerate(config.variations('data_slews', 'loads', 'transient_sim_end_time')):
         for path in cell.paths():
-            points = plan_points(cell, config, settings, variation, path, criterion)
-            random.shuffle(points)
-            results = [execute_point_fresh(p, cell=cell, config=config, settings=settings,
-                                           variation=variation, path=path) for p in points]
-            reduced = reduce_condition_results(results, criterion)
-            assemble_delay_liberty(cell, config, settings, variation, path, reduced)
+            data_slew = variation['data_slews'] * settings.units.time
+            load = variation['loads'] * settings.units.capacitance
+            t_sim_end = max(variation['transient_sim_end_time'] * settings.units.time,
+                            1000*data_slew)
+            vdd = settings.primary_power.voltage * settings.units.voltage
+            vss = settings.primary_ground.voltage * settings.units.voltage
+            group_key = (group_id, path)
+            groups.append((group_key, variation, path))
+
+            for point in plan_points(cell, config, settings, variation, path, criterion):
+                state_map = dict(point.state_condition)
+                deck_text, pin_map, measurement_names, stable_pins_map_str = _build_deck(
+                    cell, config, settings, variation, path, state_map,
+                    data_slew, load, t_sim_end, vdd, vss)
+                signature = TopologySignature(
+                    cell_hash=hashlib.md5(point.cell_name.encode()).hexdigest()[:16],
+                    netlist_hash=hashlib.md5(point.netlist_path.encode()).hexdigest()[:16],
+                    model_hashes=tuple((s or '', hashlib.md5(p.encode()).hexdigest()[:16])
+                                       for s, p in point.model_paths),
+                    pin_topology=tuple((p.name, p.role.name, pin_map.target_inputs.get(p.name,
+                                        pin_map.target_outputs.get(p.name,
+                                        pin_map.stable_inputs.get(p.name, ''))))
+                                       for p in cell.pins_in_netlist_order()),
+                    state_condition=point.state_condition,
+                    measurement_names=tuple(sorted(measurement_names)),
+                    measurement_directions=tuple(),
+                    backend=settings.simulation.backend,
+                    temperature=point.temperature,
+                    supplies_hash=hashlib.md5(str(point.supplies).encode()).hexdigest()[:16],
+                    data_slew=float(data_slew),
+                    t_sim_end=float(t_sim_end),
+                )
+                work_items.append((
+                    ctx._signature_load_key(signature), group_key, point, deck_text,
+                    signature, measurement_names, variation, path))
+
+    results_by_group = defaultdict(list)
+    for _, group_key, point, deck_text, signature, measurement_names, variation, path in sorted(
+            work_items, key=lambda item: (item[0], item[2].point_id)):
+        def fresh_retry(point=point, variation=variation, path=path):
+            return execute_point_fresh(point, cell=cell, config=config, settings=settings,
+                                       variation=variation, path=path)
+
+        result = ctx.execute_point_with_context(
+            point, deck_text, signature, measurement_names,
+            fresh_retry=fresh_retry)
+        results_by_group[group_key].append(result)
+        ledger['point_count'] += 1
+        ledger['deck_load_count'] += result.deck_load_count
+        if result.fresh_retry:
+            ledger['fresh_retry_count'] += 1
+        if result.status != 'ok':
+            ledger['error_count'] += 1
+
+    for group_key, variation, path in groups:
+        reduced = reduce_condition_results(results_by_group[group_key], criterion)
+        assemble_delay_liberty(cell, config, settings, variation, path, reduced)
     return cell.liberty
+
+
+def _build_deck(cell, config, settings, variation, path, state_map,
+                data_slew, load, t_sim_end, vdd, vss):
+    """Build the combinational delay SPICE deck for one state condition.
+    Returns (deck_text, pin_map, measurement_names, stable_pins_map_str)."""
+    # Build the test circuit
+    circuit = utils.init_circuit('comb_delay', cell.netlist, config.models,
+                                 settings.named_nodes, settings.units)
+
+    # Initialize device under test and wire up pins
+    pin_map = utils.PinStateMap(cell.inputs, cell.outputs, state_map)
+    connections = []
+    measurements_list = []
+    for pin in cell.pins_in_netlist_order():
+        match pin.role:
+            case Port.Role.LOGIC:
+                if pin.name in pin_map.target_inputs:
+                    connections.append(f'v{pin.name}')
+                    (v_0, v_1) = (vss, vdd) if pin_map.target_inputs[pin.name] == '01' else (vdd, vss)
+                    circuit.PieceWiseLinearVoltageSource(
+                        pin.name, f'v{pin.name}', circuit.gnd,
+                        values=utils.slew_pwl(v_0, v_1, data_slew, 3*data_slew,
+                                              settings.logic_thresholds.low,
+                                              settings.logic_thresholds.high))
+                elif pin.name in pin_map.target_outputs:
+                    connections.append(f'v{pin.name}')
+                    circuit.C(pin.name, f'v{pin.name}', circuit.gnd, load)
+                    for in_pin in pin_map.target_inputs:
+                        if pin_map.target_inputs[in_pin] == '01':
+                            in_direction = 'rise'
+                            threshold_prop_0 = settings.logic_thresholds.rising
+                        else:
+                            in_direction = 'fall'
+                            threshold_prop_0 = settings.logic_thresholds.falling
+                        if pin_map.target_outputs[pin.name] == '01':
+                            out_direction = 'rise'
+                            threshold_prop_1 = settings.logic_thresholds.rising
+                            threshold_tran_0 = settings.logic_thresholds.low
+                            threshold_tran_1 = settings.logic_thresholds.high
+                        else:
+                            out_direction = 'fall'
+                            threshold_prop_1 = settings.logic_thresholds.falling
+                            threshold_tran_0 = settings.logic_thresholds.high
+                            threshold_tran_1 = settings.logic_thresholds.low
+                        prop_name = f'cell_{out_direction}__{in_pin}_to_{pin.name}'.lower()
+                        measurements_list.append((
+                            'tran', prop_name,
+                            f'trig v(v{in_pin}) val={float(vdd*threshold_prop_0)} {in_direction}=1',
+                            f'targ v(v{pin.name}) val={float(vdd*threshold_prop_1)} {out_direction}=1'))
+                        tran_name = f'{out_direction}_transition__{in_pin}_to_{pin.name}'.lower()
+                        measurements_list.append((
+                            'tran', tran_name,
+                            f'trig v(v{pin.name}) val={float(vdd*threshold_tran_0)} {out_direction}=1',
+                            f'targ v(v{pin.name}) val={float(vdd*threshold_tran_1)} {out_direction}=1'))
+                elif pin.name in pin_map.stable_inputs:
+                    if pin_map.stable_inputs[pin.name] == '0':
+                        connections.append(settings.primary_ground.name)
+                    else:
+                        connections.append(settings.primary_power.name)
+                elif pin.name in pin_map.ignored_outputs:
+                    connections.append('wfloat0')
+                else:
+                    raise ValueError(f'Unable to connect unrecognized logic pin {pin.name}')
+            case Port.Role.POWER:
+                connections.append(settings.primary_power.name)
+            case Port.Role.GROUND:
+                connections.append(settings.primary_ground.name)
+            case Port.Role.NWELL:
+                connections.append(settings.nwell.name)
+            case Port.Role.PWELL:
+                connections.append(settings.pwell.name)
+            case _:
+                raise ValueError(f'Unable to connect unrecognized pin {pin.name}')
+    circuit.X('dut', cell.name, *connections)
+
+    # Run simulation
+    # Use the subprocess factory only to format the deck; the reusable path
+    # owns the single ngspice-shared instance in WorkerContext.
+    simulator = PySpice.Simulator.factory(simulator='ngspice-subprocess')
+    simulation = simulator.simulation(
+        circuit, temperature=settings.temperature, nominal_temperature=settings.temperature)
+    simulation.options('autostop', 'nopage', 'nomod', post=1, ingold=2, trtol=1)
+    for measure in measurements_list:
+        simulation.measure(*measure, run=False)
+    simulation.transient(step_time=data_slew/8, end_time=t_sim_end, run=False)
+
+    stable_pins_map_str = ', '.join(['='.join([pin, state]) for pin, state in pin_map.stable_inputs.items()])
+    measurement_names = {measure_spec[1] for measure_spec in measurements_list}
+    return str(simulation), pin_map, measurement_names, stable_pins_map_str
 
 
 def _run_single_condition(cell, config, settings, variation, path, state_map,

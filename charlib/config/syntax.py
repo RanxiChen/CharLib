@@ -221,6 +221,12 @@ class ConfigFile:
             ) : Or('ngspice-shared', 'ngspice-subprocess', 'xyce-serial', 'xyce-parallel'),
             Optional(
                 Literal(
+                    'execution_engine',
+                    description='Execution engine for supported procedures.'
+                ), default='legacy'
+            ) : Or('legacy', 'reusable_fresh', 'reusable_ngspice'),
+            Optional(
+                Literal(
                     'input_capacitance_procedure',
                     description='The name of a procedure used to measure the capacitance of ' \
                                 'each input pin for each cell.' # TODO: Refer to docs for procedures

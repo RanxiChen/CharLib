@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict
-import hashlib
+import time
 
 
 @dataclass(frozen=True)
@@ -134,17 +134,18 @@ class WorkerContext:
         return self._signature_load_key(signature) == self._signature_load_key(self._current_signature)
 
     def ensure_loaded(self, deck_text, signature):
-        """Load deck if signature doesn't match. Returns True if new load."""
+        """Load deck if signature doesn't match. Returns True if new load.
+
+        PySpice/ngspice-shared allows only one NgSpiceShared object per process, so
+        signature switches reload the deck into the existing shared object instead
+        of destroying it and constructing another instance.
+        """
         if self._signature_matches(signature):
             return False
-        if self._shared is not None:
-            try:
-                self._shared.destroy()
-            except Exception:
-                pass
         try:
-            from PySpice.Spice.NgSpice.Shared import NgSpiceShared
-            self._shared = NgSpiceShared()
+            if self._shared is None:
+                from PySpice.Spice.NgSpice.Shared import NgSpiceShared
+                self._shared = NgSpiceShared()
             self._shared.load_circuit(deck_text)
             self._current_signature = signature
             self._deck_load_count += 1
@@ -153,12 +154,12 @@ class WorkerContext:
             self.discard()
             raise
 
-    def alter_sweep_values(self, load, temperature):
+    def alter_sweep_values(self, load, temperature, output_pin='Y'):
         """Apply alterable sweep values. Must call after ensure_loaded."""
         if not self.is_loaded:
             raise RuntimeError("No circuit loaded")
         self._shared.reset()
-        self._shared.exec_command(f'alter cy c={load}')
+        self._shared.exec_command(f'alter c{str(output_pin).lower()} c={load}')
         self._shared.exec_command(f'set temp={temperature}')
 
     def run_and_extract(self):
@@ -169,13 +170,12 @@ class WorkerContext:
         return {k: float(v) for k, v in raw.items()}
 
     def discard(self):
-        """Destroy context. Subsequent uses force fresh loads."""
+        """Clear loaded signature. Keep the one shared object alive for reuse."""
         if self._shared is not None:
             try:
-                self._shared.destroy()
+                self._shared.reset()
             except Exception:
                 pass
-        self._shared = None
         self._current_signature = None
 
     def quarantine_signature(self, signature):
@@ -184,3 +184,46 @@ class WorkerContext:
         self._quarantined_signatures.add(key)
         if self.is_loaded and self._signature_load_key(self._current_signature) == key:
             self.discard()
+
+    def execute_point_with_context(self, point, deck_text, signature, measurement_names,
+                                   fresh_retry=None):
+        """Execute one point using the reusable ngspice context.
+
+        Returns a MeasurementResult. On load/alter/run/extract error, quarantine
+        the signature and retry exactly once through the supplied fresh path.
+        """
+        start = time.perf_counter()
+        try:
+            loaded = self.ensure_loaded(deck_text, signature)
+            self.alter_sweep_values(point.load, point.temperature, point.output_pin)
+            raw_measurements = self.run_and_extract()
+            measurement_names = tuple(measurement_names)
+            measurements = {name: float(raw_measurements[name])
+                            for name in measurement_names
+                            if name in raw_measurements}
+            return MeasurementResult(
+                point_id=point.point_id,
+                task_id=point.task_id,
+                signature=signature,
+                measurement=measurements,
+                status='ok',
+                timings={'total': time.perf_counter() - start},
+                fresh_retry=False,
+                deck_load_count=1 if loaded else 0,
+            )
+        except Exception as exc:
+            self.quarantine_signature(signature)
+            if fresh_retry is not None:
+                retry_result = fresh_retry()
+                retry_result.fresh_retry = True
+                return retry_result
+            return MeasurementResult(
+                point_id=point.point_id,
+                task_id=point.task_id,
+                signature=signature,
+                status='error',
+                error=str(exc),
+                timings={'total': time.perf_counter() - start},
+                fresh_retry=False,
+                deck_load_count=1,
+            )

@@ -177,3 +177,80 @@ def test_worker_context_destruction():
     ctx = WorkerContext()
     ctx.discard()
     assert not ctx.is_loaded
+
+
+
+def test_worker_context_execute_reuses_loaded_signature():
+    """execute_point_with_context reports one deck load per signature key."""
+    from charlib.characterizer.reusable_engine import WorkerContext, TopologySignature
+
+    class FakeShared:
+        def __init__(self):
+            self.loads = []
+            self.commands = []
+        def load_circuit(self, deck):
+            self.loads.append(deck)
+        def reset(self):
+            self.commands.append('reset')
+        def exec_command(self, command):
+            self.commands.append(command)
+        def run(self):
+            return {'cell_fall__a_to_y': '1.0'}
+
+    point = _make_point()
+    sig = TopologySignature(cell_hash='a', netlist_hash='b', model_hashes=(),
+                            pin_topology=(), state_condition=(),
+                            measurement_names=('cell_fall__a_to_y',),
+                            measurement_directions=(), backend='ngspice',
+                            data_slew=point.data_slew, t_sim_end=point.t_sim_end,
+                            temperature=point.temperature, supplies_hash='c')
+    ctx = WorkerContext()
+    fake = FakeShared()
+    ctx._shared = fake
+
+    first = ctx.execute_point_with_context(point, 'deck', sig, ('cell_fall__a_to_y',))
+    second = ctx.execute_point_with_context(point, 'deck', sig, ('cell_fall__a_to_y',))
+
+    assert first.status == 'ok'
+    assert second.status == 'ok'
+    assert first.deck_load_count == 1
+    assert second.deck_load_count == 0
+    assert ctx.deck_load_count == 1
+    assert fake.loads == ['deck']
+    assert 'alter cy c=2.0' in fake.commands
+
+
+def test_worker_context_execute_quarantines_and_fresh_retries():
+    """execute_point_with_context quarantines a failing signature and calls fresh retry once."""
+    from charlib.characterizer.reusable_engine import WorkerContext, TopologySignature, MeasurementResult
+
+    class FailingShared:
+        def load_circuit(self, deck):
+            pass
+        def reset(self):
+            pass
+        def exec_command(self, command):
+            raise RuntimeError('alter failed')
+
+    point = _make_point()
+    sig = TopologySignature(cell_hash='a', netlist_hash='b', model_hashes=(),
+                            pin_topology=(), state_condition=(),
+                            measurement_names=('cell_fall__a_to_y',),
+                            measurement_directions=(), backend='ngspice',
+                            data_slew=point.data_slew, t_sim_end=point.t_sim_end,
+                            temperature=point.temperature, supplies_hash='c')
+    ctx = WorkerContext()
+    ctx._shared = FailingShared()
+    calls = []
+    def retry():
+        calls.append(1)
+        return MeasurementResult(point_id=point.point_id, task_id=point.task_id,
+                                 measurement={'cell_fall__a_to_y': 1.0})
+
+    result = ctx.execute_point_with_context(point, 'deck', sig, ('cell_fall__a_to_y',),
+                                            fresh_retry=retry)
+
+    assert result.status == 'ok'
+    assert result.fresh_retry is True
+    assert calls == [1]
+    assert ctx._signature_load_key(sig) in ctx._quarantined_signatures
