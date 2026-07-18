@@ -1,8 +1,9 @@
 """Pure-data IR for reusable ngspice execution."""
 
+import time
+import os as _os
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict
-import time
 
 
 @dataclass(frozen=True)
@@ -227,3 +228,115 @@ class WorkerContext:
                 fresh_retry=False,
                 deck_load_count=1,
             )
+
+
+@dataclass
+class WorkerRequest:
+    """Pure-data request sent from parent to worker process.
+    Contains ONLY primitives, tuples, and SimulationPoint references.
+    NO Cell, Config, Settings, PySpice, Liberty, or NgSpiceShared objects."""
+    request_id: str
+    point: SimulationPoint
+    deck_text: str
+    signature: TopologySignature
+
+
+@dataclass
+class WorkerResult:
+    """Pure-data result sent from worker back to parent.
+    Contains ONLY MeasurementResult and status.
+    NO PySpice, Liberty, or NgSpiceShared objects."""
+    request_id: str
+    result: MeasurementResult
+    worker_id: int = 0
+    worker_deck_load_count: int = 0
+    worker_error: Optional[str] = None
+
+
+_worker_context: Optional[WorkerContext] = None
+_worker_id: int = -1
+
+
+def init_worker(worker_id: int = -1):
+    """Module-level initializer called once per ProcessPoolExecutor worker.
+
+    Creates the worker's own WorkerContext and NgSpiceShared instance.
+    Must be called before any execute_request calls.
+    """
+    global _worker_context, _worker_id
+    _worker_context = WorkerContext()
+    _worker_id = worker_id
+
+
+def get_worker_context() -> Optional[WorkerContext]:
+    """Return the current worker's context, or None if not initialized."""
+    return _worker_context
+
+
+def get_worker_id() -> int:
+    """Return the current worker's id, or -1 if not initialized."""
+    return _worker_id
+
+
+def shutdown_worker():
+    """Clean up the worker's context."""
+    global _worker_context, _worker_id
+    if _worker_context is not None:
+        _worker_context.discard()
+    _worker_context = None
+    _worker_id = -1
+
+
+def execute_request(request: WorkerRequest) -> WorkerResult:
+    """Execute a WorkerRequest using the per-process WorkerContext.
+
+    This is the ONLY function called by the parent process via ProcessPoolExecutor.
+    It uses the module-level WorkerContext created by init_worker().
+    """
+    global _worker_context
+    if _worker_context is None:
+        return WorkerResult(
+            request_id=request.request_id,
+            result=MeasurementResult(
+                point_id=request.point.point_id,
+                task_id=request.point.task_id,
+                status='error',
+                error='Worker not initialized',
+            ),
+            worker_id=_worker_id,
+            worker_error='Worker not initialized',
+        )
+
+    try:
+        was_loaded = _worker_context.ensure_loaded(request.deck_text, request.signature)
+        _worker_context.alter_sweep_values(request.point.load, request.point.temperature)
+        measurements = _worker_context.run_and_extract()
+
+        mresult = MeasurementResult(
+            point_id=request.point.point_id,
+            task_id=request.point.task_id,
+            signature=request.signature,
+            measurement=measurements,
+            status='ok',
+            deck_load_count=1 if was_loaded else 0,
+        )
+
+        return WorkerResult(
+            request_id=request.request_id,
+            result=mresult,
+            worker_id=_worker_id,
+            worker_deck_load_count=_worker_context.deck_load_count,
+        )
+    except Exception as e:
+        return WorkerResult(
+            request_id=request.request_id,
+            result=MeasurementResult(
+                point_id=request.point.point_id,
+                task_id=request.point.task_id,
+                status='error',
+                error=str(e),
+            ),
+            worker_id=_worker_id,
+            worker_deck_load_count=_worker_context.deck_load_count if _worker_context else 0,
+            worker_error=str(e),
+        )

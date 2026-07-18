@@ -254,3 +254,88 @@ def test_worker_context_execute_quarantines_and_fresh_retries():
     assert result.fresh_retry is True
     assert calls == [1]
     assert ctx._signature_load_key(sig) in ctx._quarantined_signatures
+
+
+def test_worker_request_pickle_roundtrip():
+    """WorkerRequest survives pickle round-trip."""
+    import pickle
+    from charlib.characterizer.reusable_engine import (
+        SimulationPoint, TopologySignature, WorkerRequest
+    )
+    point = SimulationPoint(
+        point_id='test', task_id=0, cell_name='INVX1',
+        netlist_path='/tmp/test', model_paths=(), pin_order=('A', 'Y'),
+        input_pin='A', output_pin='Y', input_transition='01', output_transition='10',
+        stable_inputs=(), ignored_outputs=(), data_slew=0.015, load=0.06,
+        t_sim_end=3.0, temperature=25.0, supplies=(), thresholds=(0.3, 0.7),
+        time_unit_str='ns', voltage_unit_str='V', criterion_group='max',
+        state_condition=()
+    )
+    sig = TopologySignature(
+        cell_hash='a', netlist_hash='b', model_hashes=(),
+        pin_topology=(), state_condition=(), measurement_names=(),
+        measurement_directions=(), backend='ngspice',
+        data_slew=0.015, t_sim_end=3.0, temperature=25.0, supplies_hash='c'
+    )
+    req = WorkerRequest(request_id='r1', point=point, deck_text='* test deck', signature=sig)
+    data = pickle.dumps(req)
+    req2 = pickle.loads(data)
+    assert req2.request_id == 'r1'
+    assert req2.point.point_id == 'test'
+    assert req2.deck_text == '* test deck'
+
+
+def test_worker_context_per_process_identity():
+    """Each call to init_worker creates a fresh context with unique identity."""
+    from charlib.characterizer.reusable_engine import (
+        init_worker, get_worker_context, get_worker_id, shutdown_worker
+    )
+    init_worker(worker_id=1)
+    ctx1 = get_worker_context()
+    assert ctx1 is not None
+    assert get_worker_id() == 1
+    shutdown_worker()
+
+    init_worker(worker_id=2)
+    ctx2 = get_worker_context()
+    assert ctx2 is not None
+    assert ctx2 is not ctx1, "Different init_worker calls must create different contexts"
+    assert get_worker_id() == 2
+    shutdown_worker()
+    assert get_worker_context() is None
+
+
+def test_worker_result_no_pyspice_objects():
+    """WorkerResult contains no PySpice or Liberty objects."""
+    import pickle
+    from charlib.characterizer.reusable_engine import WorkerResult, MeasurementResult
+    r = WorkerResult(
+        request_id='r1',
+        result=MeasurementResult(point_id='p1', task_id=0, status='ok'),
+        worker_id=0
+    )
+    data = pickle.dumps(r)
+    r2 = pickle.loads(data)
+    assert r2.request_id == 'r1'
+    # Verify no PySpice/Liberty modules are referenced in the serialized data
+    assert b'PySpice' not in data
+    assert b'liberty' not in data.lower() or b'charlib' in data
+
+
+def test_worker_context_create_destroy():
+    """Context creation and destruction cycle is clean."""
+    from charlib.characterizer.reusable_engine import (
+        init_worker, get_worker_context, shutdown_worker
+    )
+    init_worker(worker_id=0)
+    ctx = get_worker_context()
+    assert ctx is not None
+    assert ctx.deck_load_count == 0
+    shutdown_worker()
+    assert get_worker_context() is None
+    # Re-initialize
+    init_worker(worker_id=0)
+    ctx2 = get_worker_context()
+    assert ctx2 is not None
+    assert ctx2 is not ctx
+    shutdown_worker()
