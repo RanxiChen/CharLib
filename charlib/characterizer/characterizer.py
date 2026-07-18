@@ -328,7 +328,6 @@ class Characterizer:
             legacy_tasks.extend(tasks)
 
         if legacy_tasks:
-            from concurrent.futures import ProcessPoolExecutor, as_completed
             from charlib.characterizer.procedures import ProcedureFailedException
             with ProcessPoolExecutor(max_workers=self.settings.jobs) as executor:
                 futures = {executor.submit(t[0], *t[1:]): i for i, t in enumerate(legacy_tasks)}
