@@ -287,6 +287,15 @@ def shutdown_worker():
     _worker_id = -1
 
 
+def detect_missing_requests(requests, results):
+    """Return request_ids present in requests but absent from results.
+
+    The returned list preserves the order of the input requests.
+    """
+    result_ids = {result.request_id for result in results}
+    return [request.request_id for request in requests if request.request_id not in result_ids]
+
+
 def execute_request(request: WorkerRequest) -> WorkerResult:
     """Execute a WorkerRequest using the per-process WorkerContext.
 
@@ -294,6 +303,18 @@ def execute_request(request: WorkerRequest) -> WorkerResult:
     It uses the module-level WorkerContext created by init_worker().
     """
     global _worker_context
+    if request is None or request.point is None:
+        return WorkerResult(
+            request_id=getattr(request, 'request_id', 'unknown'),
+            result=MeasurementResult(
+                point_id=getattr(request.point, 'point_id', None) if request else None,
+                task_id=getattr(request.point, 'task_id', -1) if request else -1,
+                status='error',
+                error='Invalid request: point is None',
+            ),
+            worker_id=_worker_id,
+            worker_error='Invalid request: point is None',
+        )
     if _worker_context is None:
         return WorkerResult(
             request_id=request.request_id,
@@ -306,7 +327,6 @@ def execute_request(request: WorkerRequest) -> WorkerResult:
             worker_id=_worker_id,
             worker_error='Worker not initialized',
         )
-
     try:
         was_loaded = _worker_context.ensure_loaded(request.deck_text, request.signature)
         _worker_context.alter_sweep_values(request.point.load, request.point.temperature)

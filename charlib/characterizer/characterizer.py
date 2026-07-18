@@ -1,5 +1,6 @@
 """Dispatches characterization jobs and manages cell data"""
 
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from tqdm import tqdm
@@ -77,6 +78,9 @@ class Characterizer:
 
     def characterize(self):
         """Execute scheduled simulation jobs in parallel"""
+        engine = getattr(self.settings, 'execution_engine', 'legacy')
+        if engine == 'reusable_ngspice':
+            return self._characterize_reusable_ngspice()
         # Setup: Prepare simulation jobs single-threadedly (is that a word?)
         simulation_tasks = []
         for (cell, config) in self.cells:
@@ -119,6 +123,181 @@ class Characterizer:
                         fig_path.mkdir(parents=True, exist_ok=True)
                         fig.savefig(fig_path / f'{related_pin} to {pin} delay.png') # FIXME: filetype should be configurable
                         plt.close()
+        return self.library.to_liberty(precision=6)
+
+    def _characterize_reusable_ngspice(self):
+        """Execute combinational delay characterization using reusable worker contexts.
+
+        Plans all combinational delay points, dispatches WorkerRequests to a
+        process pool with per-process WorkerContexts, then deterministically
+        assembles the resulting Liberty groups.
+        """
+        import hashlib
+        from collections import defaultdict
+        from charlib.characterizer.reusable_engine import (
+            WorkerRequest, WorkerResult, execute_request, LibertyAssembler,
+            TopologySignature, MeasurementResult, detect_missing_requests, init_worker,
+        )
+        from charlib.characterizer.procedures.combinational.delay import (
+            plan_points, _build_deck, reduce_condition_results, assemble_delay_liberty,
+        )
+
+        os.environ.setdefault('OMP_NUM_THREADS', '1')
+
+        # Determine the reduction criterion from the configured combinational delay procedure
+        if self.settings.simulation.combinational_delay.__name__ == 'combinational_average':
+            from numpy import average as criterion_func
+        else:
+            criterion_func = max
+
+        work_items = []
+        group_info = {}
+        next_group_id = 0
+        cells_to_process = []
+
+        for cell, config in self.cells:
+            if cell.is_sequential:
+                # Reusable worker contexts are currently limited to combinational cells.
+                continue
+            cells_to_process.append((cell, config))
+            for variation in config.variations('data_slews', 'loads', 'transient_sim_end_time'):
+                for path in cell.paths():
+                    group_id = next_group_id
+                    next_group_id += 1
+                    group_info[group_id] = (cell, config, variation, path, criterion_func)
+
+                    data_slew = variation['data_slews'] * self.settings.units.time
+                    load = variation['loads'] * self.settings.units.capacitance
+                    t_sim_end = max(variation['transient_sim_end_time'] * self.settings.units.time,
+                                    1000 * data_slew)
+                    vdd = self.settings.primary_power.voltage * self.settings.units.voltage
+                    vss = self.settings.primary_ground.voltage * self.settings.units.voltage
+
+                    for point in plan_points(cell, config, self.settings, variation, path, criterion_func):
+                        state_map = dict(point.state_condition)
+                        deck_text, pin_map, measurement_names, stable_pins_map_str = _build_deck(
+                            cell, config, self.settings, variation, path, state_map,
+                            data_slew, load, t_sim_end, vdd, vss)
+                        signature = TopologySignature(
+                            cell_hash=hashlib.md5(point.cell_name.encode()).hexdigest()[:16],
+                            netlist_hash=hashlib.md5(point.netlist_path.encode()).hexdigest()[:16],
+                            model_hashes=tuple((s or '', hashlib.md5(p.encode()).hexdigest()[:16])
+                                              for s, p in point.model_paths),
+                            pin_topology=tuple((p.name, p.role.name,
+                                                pin_map.target_inputs.get(p.name,
+                                                    pin_map.target_outputs.get(p.name,
+                                                        pin_map.stable_inputs.get(p.name, ''))))
+                                               for p in cell.pins_in_netlist_order()),
+                            state_condition=point.state_condition,
+                            measurement_names=tuple(sorted(measurement_names)),
+                            measurement_directions=tuple(),
+                            backend=self.settings.simulation.backend,
+                            temperature=point.temperature,
+                            supplies_hash=hashlib.md5(str(point.supplies).encode()).hexdigest()[:16],
+                            data_slew=float(data_slew),
+                            t_sim_end=float(t_sim_end),
+                        )
+                        request = WorkerRequest(
+                            request_id=point.point_id,
+                            point=point,
+                            deck_text=deck_text,
+                            signature=signature,
+                        )
+                        work_items.append((request, group_id))
+
+        requests = [item[0] for item in work_items]
+        request_map = {request.request_id: (request, group_id) for request, group_id in work_items}
+
+        results_by_id = {}
+        if requests:
+            max_workers = self.settings.jobs if self.settings.jobs is not None else 1
+            with ProcessPoolExecutor(max_workers=max_workers,
+                                     initializer=init_worker,
+                                     initargs=(0,)) as executor:
+                futures = {executor.submit(execute_request, request): request.request_id
+                           for request in requests}
+                for future in as_completed(futures):
+                    request_id = futures[future]
+                    try:
+                        worker_result = future.result()
+                    except Exception:
+                        results_by_id[request_id] = MeasurementResult(
+                            point_id=request_map[request_id][0].point.point_id,
+                            task_id=request_map[request_id][0].point.task_id,
+                            status='error',
+                            error='Worker crashed during execution',
+                        )
+                    else:
+                        results_by_id[request_id] = worker_result.result
+
+        # Detect any missing results and record them without producing partial Liberty.
+        missing_ids = detect_missing_requests(
+            requests,
+            [WorkerResult(request_id=request_id, result=result)
+             for request_id, result in results_by_id.items()])
+        if missing_ids:
+            for request_id in missing_ids:
+                request, _ = request_map[request_id]
+                results_by_id[request_id] = MeasurementResult(
+                    point_id=request.point.point_id,
+                    task_id=request.point.task_id,
+                    status='error',
+                    error='Result missing after worker execution',
+                )
+            raise RuntimeError(
+                f"Reusable ngspice characterization failed; {len(missing_ids)} result(s) missing: "
+                f"{missing_ids[:10]}"
+            )
+
+        # Fail early if any individual point returned an error status.
+        error_ids = [request_id for request_id, result in results_by_id.items()
+                     if result.status != 'ok']
+        if error_ids:
+            raise RuntimeError(
+                f"Reusable ngspice characterization failed for {len(error_ids)} point(s): "
+                f"{error_ids[:10]}"
+            )
+
+        # Deterministic final assembly ordered by point_id.
+        assembler = LibertyAssembler()
+        assembler.add_results(list(results_by_id.values()))
+        ordered_results = assembler.ordered_results()
+
+        groups = defaultdict(list)
+        for result in ordered_results:
+            _, group_id = request_map[result.point_id]
+            groups[group_id].append(result)
+
+        for group_id, results in groups.items():
+            cell, config, variation, path, criterion_func = group_info[group_id]
+            reduced = reduce_condition_results(results, criterion_func)
+            assemble_delay_liberty(cell, config, self.settings, variation, path, reduced)
+
+        for cell, config in cells_to_process:
+            self.library.add_group(cell.liberty)
+
+        # Post-processing: Fetch generated table templates and add them to the library
+        lut_templates = []
+        for timing_group in self.library.subgroups_with_name('timing'):
+            lut_templates += [lut_group.template for lut_group in timing_group.groups.values()]
+        [self.library.add_group(lut_template) for lut_template in lut_templates]
+
+        # Plot delay surfaces (if desired)
+        for (cell, config) in self.cells:
+            cell_group = self.library.group('cell', cell.name)
+            if 'delay' in config.plots:
+                for pin_group in cell_group.subgroups_with_name('pin'):
+                    pin = pin_group.identifier
+                    for timing_group in pin_group.subgroups_with_name('timing'):
+                        related_pin = timing_group.attributes['related_pin'].value
+                        fig = plots.plot_delay_surfaces(list(timing_group.groups.values()),
+                                                        title=f'Cell delays ({related_pin} to {pin})')
+                        # FIXME: let user decide whether to show or save
+                        fig_path = self.settings.plots_dir / cell.name
+                        fig_path.mkdir(parents=True, exist_ok=True)
+                        fig.savefig(fig_path / f'{related_pin} to {pin} delay.png')
+                        plt.close()
+
         return self.library.to_liberty(precision=6)
 
 

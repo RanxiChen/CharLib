@@ -339,3 +339,41 @@ def test_worker_context_create_destroy():
     assert ctx2 is not None
     assert ctx2 is not ctx
     shutdown_worker()
+
+
+def test_scrambled_result_order():
+    """LibertyAssembler sorting by point_id restores determinism."""
+    from charlib.characterizer.reusable_engine import LibertyAssembler, MeasurementResult
+    assembler = LibertyAssembler()
+    results = [
+        MeasurementResult(point_id='point_z', task_id=0),
+        MeasurementResult(point_id='point_a', task_id=1),
+        MeasurementResult(point_id='point_m', task_id=2),
+    ]
+    assembler.add_results(results)
+    ordered = assembler.ordered_results()
+    assert [result.point_id for result in ordered] == ['point_a', 'point_m', 'point_z']
+
+
+def test_worker_failure_graceful():
+    """A None point produces an error WorkerResult, not an exception."""
+    from charlib.characterizer.reusable_engine import execute_request, WorkerRequest
+    req = WorkerRequest(request_id='r1', point=None, deck_text='', signature=None)
+    result = execute_request(req)
+    assert result.request_id == 'r1'
+    assert result.result.status == 'error'
+    assert result.worker_error is not None
+
+
+def test_missing_point_detection():
+    """detect_missing_requests reports requests that have no matching result."""
+    from charlib.characterizer.reusable_engine import (
+        detect_missing_requests, WorkerRequest, WorkerResult, MeasurementResult
+    )
+    requests = [
+        WorkerRequest(request_id='a', point=None, deck_text='', signature=None),
+        WorkerRequest(request_id='b', point=None, deck_text='', signature=None),
+    ]
+    results = [WorkerResult(request_id='a',
+                            result=MeasurementResult(point_id='a', task_id=0))]
+    assert detect_missing_requests(requests, results) == ['b']
