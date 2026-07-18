@@ -5,10 +5,13 @@ import json
 import signal
 import tempfile
 import multiprocessing
+from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
 import pytest
+import yaml
 
+from charlib.config.syntax import ConfigFile
 from charlib.characterizer.scheduler import (
     TaskRecord,
     TaskResult,
@@ -252,6 +255,70 @@ class TestExecutionEngineConfig:
     def test_cost_policy_validation(self):
         with pytest.raises(ValueError, match="scheduler_cost_policy"):
             SimulationSettings(scheduler_cost_policy="random")
+
+
+class TestYAMLExecutionEngineConfig:
+    """YAML round-trip tests for simulation execution_engine and batch config."""
+
+    W1_YAML_PATH = Path(__file__).parent.parent / 'pdks' / 'ex_osu350_invx1.yaml'
+
+    @pytest.fixture
+    def w1_config(self):
+        with open(self.W1_YAML_PATH) as f:
+            return yaml.safe_load(f)
+
+    def test_yaml_batched_engine_passes(self, w1_config):
+        """A real YAML with execution_engine=batched validates and is wired to SimulationSettings."""
+        w1_config['settings']['simulation'] = {
+            'execution_engine': 'batched',
+            'scheduler_batch_factor': 4,
+            'scheduler_max_inflight_per_worker': 2,
+        }
+        validated = ConfigFile.validate(w1_config)
+        sim = validated['settings']['simulation']
+        assert sim['execution_engine'] == 'batched'
+        settings = SimulationSettings(**sim)
+        assert settings.execution_engine == 'batched'
+        assert settings.scheduler_batch_factor == 4
+        assert settings.scheduler_max_inflight_per_worker == 2
+
+    def test_yaml_missing_simulation_defaults_to_legacy(self, w1_config):
+        """A real YAML without a simulation section defaults to legacy execution."""
+        w1_config['settings'].pop('simulation', None)
+        validated = ConfigFile.validate(w1_config)
+        assert 'simulation' not in validated['settings']
+        settings = SimulationSettings(**validated['settings'].get('simulation', {}))
+        assert settings.execution_engine == 'legacy'
+
+    def test_yaml_invalid_engine_raises(self, w1_config):
+        """An invalid execution_engine in YAML raises ValueError."""
+        w1_config['settings']['simulation'] = {'execution_engine': 'invalid'}
+        with pytest.raises(ValueError, match="Invalid execution_engine"):
+            ConfigFile.validate(w1_config)
+
+    def test_yaml_batch_factor_preserved(self, w1_config):
+        """scheduler_batch_factor is preserved through ConfigFile.validate."""
+        w1_config['settings']['simulation'] = {'scheduler_batch_factor': 8}
+        validated = ConfigFile.validate(w1_config)
+        sim = validated['settings']['simulation']
+        assert sim['scheduler_batch_factor'] == 8
+
+    def test_yaml_round_trip(self, w1_config):
+        """YAML -> ConfigFile -> YAML preserves all simulation fields."""
+        w1_config['settings']['simulation'] = {
+            'execution_engine': 'batched',
+            'scheduler_batch_factor': 8,
+            'scheduler_max_inflight_per_worker': 4,
+            'scheduler_cost_policy': 'measured_lpt',
+        }
+        validated = ConfigFile.validate(w1_config)
+        dumped = yaml.safe_dump(validated, sort_keys=False)
+        reparsed = yaml.safe_load(dumped)
+        sim = reparsed['settings']['simulation']
+        assert sim['execution_engine'] == 'batched'
+        assert sim['scheduler_batch_factor'] == 8
+        assert sim['scheduler_max_inflight_per_worker'] == 4
+        assert sim['scheduler_cost_policy'] == 'measured_lpt'
 
 
 class TestDeterministicMerge:

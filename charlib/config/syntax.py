@@ -300,6 +300,34 @@ class ConfigFile:
                     description='The name of a procedure used to find the minimum pulse width ' \
                                 'constraints associated with edge-sensitive pins'
                 ), default='min_pulse_width_constraint'
+            ) : str,
+            Optional(
+                Literal(
+                    'execution_engine',
+                    description='Execution engine used for scheduling simulation tasks. ' \
+                                'Options: "legacy" (default) or "batched".'
+                ), default='legacy'
+            ) : str,
+            Optional(
+                Literal(
+                    'scheduler_batch_factor',
+                    description='Batching factor used by the batched execution engine. ' \
+                                'Must be an integer >= 1.'
+                ), default=4
+            ) : int,
+            Optional(
+                Literal(
+                    'scheduler_max_inflight_per_worker',
+                    description='Maximum number of in-flight tasks per worker in the ' \
+                                'batched execution engine. Must be an integer >= 1.'
+                ), default=2
+            ) : int,
+            Optional(
+                Literal(
+                    'scheduler_cost_policy',
+                    description='Cost policy used by the batched scheduler to order tasks. ' \
+                                'Default is "measured_lpt".'
+                ), default='measured_lpt'
             ) : str
         },
 
@@ -535,7 +563,12 @@ class ConfigFile:
         config['settings'].pop('cell_defaults')
 
         # Validate the schema
-        return cls.config_file_syntax.validate(config)
+        validated = cls.config_file_syntax.validate(config)
+        # Eagerly validate simulation settings so invalid YAML values surface as
+        # ValueError with a clear message before Characterizer construction.
+        from charlib.characterizer.characterizer import SimulationSettings
+        SimulationSettings(**validated['settings'].get('simulation', {}))
+        return validated
 
 
     class SchemaKind(Enum):
