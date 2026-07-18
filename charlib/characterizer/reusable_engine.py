@@ -329,7 +329,7 @@ def execute_request(request: WorkerRequest) -> WorkerResult:
         )
     try:
         was_loaded = _worker_context.ensure_loaded(request.deck_text, request.signature)
-        _worker_context.alter_sweep_values(request.point.load, request.point.temperature)
+        _worker_context.alter_sweep_values(request.point.load, request.point.temperature, request.point.output_pin)
         measurements = _worker_context.run_and_extract()
 
         mresult = MeasurementResult(
