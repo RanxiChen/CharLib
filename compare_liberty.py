@@ -272,7 +272,7 @@ def numeric_records(library: Group) -> dict[tuple, NumericRecord]:
 
 def _normalize_when(when: str) -> str:
     """Normalize a leakage 'when' condition so equivalent orderings match."""
-    return "".join(sorted(when.replace(" ", "").replace("\t", "").lower()))
+    when = when.replace(" ", "").replace("\t", ""); terms = [t.lower() for t in when.split("&")]; return "&".join(sorted(terms))
 
 
 def text_records(library: Group) -> dict[tuple[str, str, str], str]:
