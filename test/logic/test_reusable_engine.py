@@ -18,7 +18,7 @@ from charlib.characterizer.reusable_engine import (
 )
 
 
-def _make_point(point_id="p1") -> SimulationPoint:
+def _make_point(point_id="p1", load=2.0, temperature=25.0) -> SimulationPoint:
     return SimulationPoint(
         point_id=point_id,
         task_id=1,
@@ -33,9 +33,9 @@ def _make_point(point_id="p1") -> SimulationPoint:
         stable_inputs=("A",),
         ignored_outputs=(),
         data_slew=1.0,
-        load=2.0,
+        load=load,
         t_sim_end=10.0,
-        temperature=25.0,
+        temperature=temperature,
         supplies=(("VDD", 1.8),),
         thresholds=(0.5, 0.5),
         time_unit_str="ns",
@@ -377,3 +377,261 @@ def test_missing_point_detection():
     results = [WorkerResult(request_id='a',
                             result=MeasurementResult(point_id='a', task_id=0))]
     assert detect_missing_requests(requests, results) == ['b']
+
+
+# ---------------------------------------------------------------------------
+# Batch protocol tests
+# ---------------------------------------------------------------------------
+
+def _make_signature(name="sig"):
+    return TopologySignature(
+        cell_hash=name,
+        netlist_hash='b',
+        model_hashes=(),
+        pin_topology=(),
+        state_condition=(),
+        measurement_names=('cell_fall__a_to_y',),
+        measurement_directions=(),
+        backend='ngspice',
+        data_slew=0.015,
+        t_sim_end=3.0,
+        temperature=25.0,
+        supplies_hash='c',
+    )
+
+
+class _FakeShared:
+    """Minimal stand-in for PySpice shared ngspice object."""
+    def __init__(self, measurements=None, fail_on_run_for=None):
+        self.loads = []
+        self.commands = []
+        self.measurements = measurements or {'cell_fall__a_to_y': '1.0'}
+        self.fail_on_run_for = set(fail_on_run_for or [])
+
+    def load_circuit(self, deck):
+        self.loads.append(deck)
+
+    def reset(self):
+        self.commands.append('reset')
+
+    def exec_command(self, command):
+        self.commands.append(command)
+
+    def run(self):
+        # Use exec_command history to identify which point is running. This is a
+        # crude but deterministic proxy: the last alter command tells us the
+        # load value currently being simulated.
+        for cmd in reversed(self.commands):
+            if cmd.startswith('alter') and 'c=99.0' in cmd:
+                if '99.0' in self.fail_on_run_for:
+                    raise RuntimeError('simulated run failure')
+        return self.measurements
+
+
+def _init_fake_worker(shared):
+    from charlib.characterizer.reusable_engine import init_worker, get_worker_context, shutdown_worker
+    shutdown_worker()
+    init_worker(worker_id=42)
+    ctx = get_worker_context()
+    ctx._shared = shared
+    return ctx
+
+
+def test_batch_types_pickleable():
+    """SignatureGroup, WorkerBatchRequest, and WorkerBatchResult are pickleable."""
+    from charlib.characterizer.reusable_engine import (
+        SignatureGroup, WorkerBatchRequest, WorkerBatchResult, WorkerResult
+    )
+    point = _make_point()
+    sig = _make_signature()
+    group = SignatureGroup(
+        signature=sig,
+        deck_text='deck',
+        measurement_names=('cell_fall__a_to_y',),
+        sweep_points=(point,),
+    )
+    req = WorkerBatchRequest(batch_id='batch_0', groups=(group,))
+    data = pickle.dumps(req)
+    req2 = pickle.loads(data)
+    assert req2.batch_id == 'batch_0'
+    assert req2.groups[0].deck_text == 'deck'
+    assert req2.groups[0].sweep_points[0].point_id == point.point_id
+
+    result = WorkerBatchResult(
+        batch_id='batch_0',
+        results=(WorkerResult(request_id='p1', result=MeasurementResult(point_id='p1', task_id=1)),),
+        worker_pid=1234,
+    )
+    data = pickle.dumps(result)
+    result2 = pickle.loads(data)
+    assert result2.batch_id == 'batch_0'
+    assert result2.results[0].request_id == 'p1'
+    assert result2.worker_pid == 1234
+
+
+def test_execute_batch_one_load_per_signature():
+    """execute_batch loads each signature exactly once."""
+    from charlib.characterizer.reusable_engine import (
+        SignatureGroup, WorkerBatchRequest, execute_batch
+    )
+    shared = _FakeShared()
+    _init_fake_worker(shared)
+
+    sig_a = _make_signature('a')
+    sig_b = _make_signature('b')
+    points_a = [_make_point('a1', load=1.0), _make_point('a2', load=2.0)]
+    points_b = [_make_point('b1', load=3.0)]
+    request = WorkerBatchRequest(
+        batch_id='batch',
+        groups=(
+            SignatureGroup(signature=sig_a, deck_text='deck_a',
+                           measurement_names=('cell_fall__a_to_y',), sweep_points=tuple(points_a)),
+            SignatureGroup(signature=sig_b, deck_text='deck_b',
+                           measurement_names=('cell_fall__a_to_y',), sweep_points=tuple(points_b)),
+        ),
+    )
+    result = execute_batch(request)
+    assert result.batch_id == 'batch'
+    assert len(result.results) == 3
+    # Two distinct decks loaded, once each.
+    assert shared.loads == ['deck_a', 'deck_b']
+    # Each point produced an ok result.
+    assert all(r.result.status == 'ok' for r in result.results)
+
+
+def test_execute_batch_compact_results():
+    """execute_batch returns only the requested measurement names."""
+    from charlib.characterizer.reusable_engine import (
+        SignatureGroup, WorkerBatchRequest, execute_batch
+    )
+    shared = _FakeShared(measurements={
+        'cell_fall__a_to_y': '1.0',
+        'cell_rise__a_to_y': '2.0',
+        'unwanted_metric': '3.0',
+    })
+    _init_fake_worker(shared)
+
+    point = _make_point('p1')
+    sig = _make_signature()
+    request = WorkerBatchRequest(
+        batch_id='batch',
+        groups=(SignatureGroup(signature=sig, deck_text='deck',
+                                measurement_names=('cell_fall__a_to_y', 'cell_rise__a_to_y'),
+                                sweep_points=(point,)),),
+    )
+    result = execute_batch(request)
+    assert len(result.results) == 1
+    assert result.results[0].result.measurement == {
+        'cell_fall__a_to_y': 1.0,
+        'cell_rise__a_to_y': 2.0,
+    }
+    assert 'unwanted_metric' not in result.results[0].result.measurement
+
+
+def test_execute_batch_worker_crash_graceful():
+    """execute_batch returns an error result, not an exception, when run() fails."""
+    from charlib.characterizer.reusable_engine import (
+        SignatureGroup, WorkerBatchRequest, execute_batch
+    )
+
+    class CrashingShared:
+        def load_circuit(self, deck):
+            pass
+        def reset(self):
+            pass
+        def exec_command(self, command):
+            pass
+        def run(self):
+            raise RuntimeError('ngspice crashed')
+
+    _init_fake_worker(CrashingShared())
+    point = _make_point('p1')
+    sig = _make_signature()
+    request = WorkerBatchRequest(
+        batch_id='batch',
+        groups=(SignatureGroup(signature=sig, deck_text='deck',
+                                measurement_names=('cell_fall__a_to_y',),
+                                sweep_points=(point,)),),
+    )
+    result = execute_batch(request)
+    assert len(result.results) == 1
+    assert result.results[0].result.status == 'error'
+    assert 'ngspice crashed' in result.results[0].result.error
+
+
+def test_batch_result_no_pyspice_objects():
+    """WorkerBatchResult pickle stream contains no PySpice/Liberty references."""
+    from charlib.characterizer.reusable_engine import (
+        SignatureGroup, WorkerBatchRequest, WorkerBatchResult, WorkerResult
+    )
+    point = _make_point()
+    group = SignatureGroup(
+        signature=_make_signature(), deck_text='deck',
+        measurement_names=('cell_fall__a_to_y',), sweep_points=(point,),
+    )
+    req = WorkerBatchRequest(batch_id='batch_0', groups=(group,))
+    data = pickle.dumps(req)
+    assert b'PySpice' not in data
+    assert b'NgSpiceShared' not in data
+
+    result = WorkerBatchResult(
+        batch_id='batch_0',
+        results=(WorkerResult(request_id='p1', result=MeasurementResult(point_id='p1', task_id=1)),),
+        worker_pid=1234,
+    )
+    data = pickle.dumps(result)
+    assert b'PySpice' not in data
+    assert b'NgSpiceShared' not in data
+
+
+def test_lpt_batch_groups_sorts_and_balances():
+    """lpt_batch_groups sorts groups descending and balances point counts."""
+    from charlib.characterizer.reusable_engine import (
+        SignatureGroup, lpt_batch_groups
+    )
+    sig = _make_signature()
+    groups = [
+        SignatureGroup(signature=sig, deck_text=f'deck_{i}',
+                       measurement_names=(), sweep_points=tuple(_make_point(f'p{i}_{j}') for j in range(size)))
+        for i, size in enumerate([5, 3, 2, 1])
+    ]
+    batches = lpt_batch_groups(groups, num_workers=1)
+    # With 4 groups and 1 worker, max_batches = 4, so each group is its own batch.
+    assert len(batches) == 4
+    # LPT order: largest group first.
+    assert [len(b[0].sweep_points) for b in batches] == [5, 3, 2, 1]
+
+
+def test_lpt_batch_groups_bounded_in_flight():
+    """lpt_batch_groups never produces more than 4*N batches."""
+    from charlib.characterizer.reusable_engine import (
+        SignatureGroup, lpt_batch_groups
+    )
+    sig = _make_signature()
+    groups = [
+        SignatureGroup(signature=sig, deck_text=f'deck_{i}',
+                       measurement_names=(), sweep_points=tuple(_make_point(f'p{i}_{j}') for j in range(2)))
+        for i in range(20)
+    ]
+    for num_workers in (1, 2, 4, 8):
+        batches = lpt_batch_groups(groups, num_workers=num_workers)
+        assert len(batches) <= 4 * num_workers
+        # All groups are preserved
+        assert sum(len(b) for b in batches) == len(groups)
+
+
+def test_lpt_batch_groups_same_signature_not_split():
+    """A single SignatureGroup is never split across batches."""
+    from charlib.characterizer.reusable_engine import (
+        SignatureGroup, lpt_batch_groups
+    )
+    sig = _make_signature()
+    group = SignatureGroup(
+        signature=sig,
+        deck_text='deck',
+        measurement_names=(),
+        sweep_points=tuple(_make_point(f'p{i}') for i in range(10)),
+    )
+    batches = lpt_batch_groups([group], num_workers=4)
+    assert len(batches) == 1
+    assert batches[0][0] is group

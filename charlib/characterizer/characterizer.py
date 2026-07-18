@@ -1,11 +1,6 @@
 """Dispatches characterization jobs and manages cell data"""
 
 import os
-import time
-import sys
-import json
-import pickle
-from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from tqdm import tqdm
@@ -27,102 +22,6 @@ import charlib.characterizer.procedures.sequential.constraint.metastability.c2q_
 import charlib.characterizer.procedures.sequential.constraint.recovery
 import charlib.characterizer.procedures.sequential.constraint.removal
 import charlib.characterizer.procedures.sequential.constraint.min_pulse_width
-
-class ReusableDiagnostics:
-    """Opt-in diagnostics collector for _characterize_reusable_ngspice.
-
-    Enabled via ``settings.diagnostics`` or the ``CHARLIB_DIAGNOSTICS=1``
-    environment variable. When disabled, all operations are no-ops and no
-    extra files are written.
-    """
-
-    def __init__(self, enabled=False, output_dir=None):
-        self.enabled = enabled
-        self.output_dir = output_dir or '/tmp'
-        self.timings = {}
-        self.counts = defaultdict(int)
-        self.worker_pids = set()
-        self.worker_points = defaultdict(int)
-        self.worker_signatures = defaultdict(list)
-        self.worker_signature_switches = defaultdict(int)
-        self.start_time = time.time()
-        self._timers = {}
-        self._max_worker_metrics = {}
-
-    def start_timer(self, name):
-        if self.enabled:
-            self._timers[name] = time.perf_counter()
-
-    def stop_timer(self, name):
-        if self.enabled and name in self._timers:
-            elapsed = time.perf_counter() - self._timers.pop(name)
-            self.timings[name] = self.timings.get(name, 0.0) + elapsed
-            return elapsed
-        return 0.0
-
-    def record_rss(self, label=''):
-        if self.enabled:
-            try:
-                import psutil
-                proc = psutil.Process()
-                rss_mb = proc.memory_info().rss / (1024 * 1024)
-                self.timings[f'rss_mb_{label}'] = rss_mb
-                return rss_mb
-            except Exception:
-                self.timings[f'rss_mb_{label}'] = -1
-                return -1
-        return 0
-
-    def record_worker_result(self, worker_result):
-        if not self.enabled:
-            return
-        pid = worker_result.worker_pid
-        self.worker_pids.add(pid)
-        self.worker_points[pid] += 1
-        sig = worker_result.result.signature if worker_result.result else None
-        self.worker_signatures[pid].append(repr(sig) if sig is not None else None)
-        self.worker_signature_switches[pid] = max(
-            self.worker_signature_switches[pid],
-            getattr(worker_result, 'worker_signature_switch_count', 0),
-        )
-        metrics = self._max_worker_metrics.setdefault(pid, {})
-        for key in ('worker_deck_load_count', 'worker_reset_count', 'worker_alter_count',
-                    'worker_run_count', 'worker_extract_count', 'worker_context_create_count',
-                    'worker_signature_switch_count'):
-            val = getattr(worker_result, key, 0)
-            current = metrics.get(key, 0)
-            if val > current:
-                metrics[key] = val
-
-    def finalize_worker_counts(self):
-        if not self.enabled:
-            return
-        for metrics in self._max_worker_metrics.values():
-            self.counts['deck_loads'] += metrics.get('worker_deck_load_count', 0)
-            self.counts['resets'] += metrics.get('worker_reset_count', 0)
-            self.counts['alters'] += metrics.get('worker_alter_count', 0)
-            self.counts['runs'] += metrics.get('worker_run_count', 0)
-            self.counts['extracts'] += metrics.get('worker_extract_count', 0)
-            self.counts['context_creates'] += metrics.get('worker_context_create_count', 0)
-            self.counts['signature_switches'] += metrics.get('worker_signature_switch_count', 0)
-        self.counts['workers'] = len(self.worker_pids)
-
-    def save(self):
-        if not self.enabled:
-            return
-        os.makedirs(self.output_dir, exist_ok=True)
-        report = {
-            'wall_time_s': time.time() - self.start_time,
-            'timings': dict(self.timings),
-            'counts': dict(self.counts),
-            'worker_pids': sorted(list(self.worker_pids)),
-            'worker_point_counts': dict(self.worker_points),
-            'worker_signature_switches': dict(self.worker_signature_switches),
-        }
-        with open(os.path.join(self.output_dir, 'diagnostics.json'), 'w') as f:
-            json.dump(report, f, indent=2, default=str)
-        print(f"Diagnostics saved to {self.output_dir}/diagnostics.json")
-
 
 class Characterizer:
     """Main object of Charlib. Keeps track of settings and cells, and schedules simulations."""
@@ -229,29 +128,25 @@ class Characterizer:
     def _characterize_reusable_ngspice(self):
         """Execute combinational delay characterization using reusable worker contexts.
 
-        Plans all combinational delay points, dispatches WorkerRequests to a
-        process pool with per-process WorkerContexts, then deterministically
-        assembles the resulting Liberty groups.
+        Plans all combinational delay points, groups them by topology signature so that
+        each signature loads its deck exactly once, packs signatures into batches using
+        LPT bin-packing over point counts, dispatches WorkerBatchRequests objects to a
+        process pool with per-process WorkerContexts, then deterministically assembles
+        the resulting Liberty groups.
         """
         import hashlib
+        from collections import defaultdict
         from charlib.characterizer.reusable_engine import (
-            WorkerRequest, WorkerResult, execute_request, LibertyAssembler,
+            WorkerContext, WorkerRequest, WorkerResult, execute_request, LibertyAssembler,
             TopologySignature, MeasurementResult, detect_missing_requests, init_worker,
+            SignatureGroup, WorkerBatchRequest, WorkerBatchResult, execute_batch,
+            lpt_batch_groups,
         )
         from charlib.characterizer.procedures.combinational.delay import (
             plan_points, _build_deck, reduce_condition_results, assemble_delay_liberty,
         )
 
         os.environ.setdefault('OMP_NUM_THREADS', '1')
-
-        # Opt-in diagnostics: disabled by default, enabled via settings.diagnostics
-        # or the CHARLIB_DIAGNOSTICS environment variable.
-        diag_enabled = getattr(self.settings, 'diagnostics', False) or os.environ.get('CHARLIB_DIAGNOSTICS', '') == '1'
-        diag_output = os.environ.get('CHARLIB_DIAGNOSTICS_DIR',
-                                     '/home/ubuntu/benchmark-results/2026-07-18/track-r/diagnostics')
-        diag = ReusableDiagnostics(enabled=diag_enabled, output_dir=diag_output)
-        diag.record_rss('start')
-        diag.start_timer('plan_total')
 
         # Determine the reduction criterion from the configured combinational delay procedure
         if self.settings.simulation.combinational_delay.__name__ == 'combinational_average':
@@ -282,13 +177,11 @@ class Characterizer:
                     vdd = self.settings.primary_power.voltage * self.settings.units.voltage
                     vss = self.settings.primary_ground.voltage * self.settings.units.voltage
 
-                    diag.start_timer('build_deck_total')
                     for point in plan_points(cell, config, self.settings, variation, path, criterion_func):
                         state_map = dict(point.state_condition)
                         deck_text, pin_map, measurement_names, stable_pins_map_str = _build_deck(
                             cell, config, self.settings, variation, path, state_map,
                             data_slew, load, t_sim_end, vdd, vss)
-                        diag.start_timer('request_construction')
                         signature = TopologySignature(
                             cell_hash=hashlib.md5(point.cell_name.encode()).hexdigest()[:16],
                             netlist_hash=hashlib.md5(point.netlist_path.encode()).hexdigest()[:16],
@@ -308,70 +201,85 @@ class Characterizer:
                             data_slew=float(data_slew),
                             t_sim_end=float(t_sim_end),
                         )
-                        request = WorkerRequest(
-                            request_id=point.point_id,
-                            point=point,
-                            deck_text=deck_text,
-                            signature=signature,
-                        )
-                        work_items.append((request, group_id))
-                        diag.stop_timer('request_construction')
-                    diag.stop_timer('build_deck_total')
+                        work_items.append((point, group_id, signature, deck_text, measurement_names))
 
-        requests = [item[0] for item in work_items]
-        request_map = {request.request_id: (request, group_id) for request, group_id in work_items}
+        # Group points by signature load key. All points that share a signature share a deck.
+        signature_groups: dict = {}
+        point_to_group_id = {}
+        expected_point_ids = []
+        for point, group_id, signature, deck_text, measurement_names in work_items:
+            expected_point_ids.append(point.point_id)
+            point_to_group_id[point.point_id] = group_id
+            key = WorkerContext._signature_load_key(signature)
+            if key not in signature_groups:
+                signature_groups[key] = SignatureGroup(
+                    signature=signature,
+                    deck_text=deck_text,
+                    measurement_names=tuple(sorted(measurement_names)),
+                    sweep_points=(),
+                )
+                # Defensive: ensure deck_text/measurement_names are consistent for the key.
+                # If two points produce the same signature but different decks, keep the first.
+            existing = signature_groups[key]
+            existing = SignatureGroup(
+                signature=existing.signature,
+                deck_text=existing.deck_text,
+                measurement_names=existing.measurement_names,
+                sweep_points=existing.sweep_points + (point,),
+            )
+            signature_groups[key] = existing
 
-        # Record planning/building diagnostics before dispatching workers.
-        diag.counts['requests'] = len(requests)
-        diag.counts['points'] = len(requests)
-        diag.counts['futures'] = len(requests)
-        diag.counts['signatures'] = len({request.signature for request in requests})
-        diag.counts['requested_jobs'] = self.settings.jobs
-        if requests:
-            diag.timings['estimated_pickle_bytes'] = sys.getsizeof(pickle.dumps(requests[0])) * len(requests)
-        diag.record_rss('after_planning')
-        diag.stop_timer('plan_total')
-        diag.start_timer('pool_submit')
+        # LPT sort by point count descending, then pack into 2N..4N micro-batches.
+        num_workers = self.settings.jobs if self.settings.jobs is not None else 1
+        batches = lpt_batch_groups(list(signature_groups.values()), num_workers)
+
+        batch_requests = []
+        for index, batch_groups in enumerate(batches):
+            if not batch_groups:
+                continue
+            batch_requests.append(WorkerBatchRequest(
+                batch_id=f"batch_{index}",
+                groups=tuple(batch_groups),
+            ))
+
+        # Convert old per-point request objects only for missing-point detection.
+        requests = [
+            WorkerRequest(request_id=point.point_id, point=point, deck_text='', signature=signature)
+            for point, _, signature, _, _ in work_items
+        ]
+        request_map = {req.request_id: req for req in requests}
 
         results_by_id = {}
-        if requests:
-            max_workers = self.settings.jobs if self.settings.jobs is not None else 1
+        if batch_requests:
+            max_workers = num_workers
             with ProcessPoolExecutor(max_workers=max_workers,
                                      initializer=init_worker,
                                      initargs=(0,)) as executor:
-                futures = {executor.submit(execute_request, request): request.request_id
-                           for request in requests}
+                futures = {executor.submit(execute_batch, request): request.batch_id
+                           for request in batch_requests}
                 for future in as_completed(futures):
                     request_id = futures[future]
                     try:
-                        worker_result = future.result()
+                        batch_result = future.result()
+                        for worker_result in batch_result.results:
+                            results_by_id[worker_result.request_id] = worker_result.result
                     except Exception:
-                        results_by_id[request_id] = MeasurementResult(
-                            point_id=request_map[request_id][0].point.point_id,
-                            task_id=request_map[request_id][0].point.task_id,
-                            status='error',
-                            error='Worker crashed during execution',
-                        )
-                    else:
-                        results_by_id[request_id] = worker_result.result
-                        diag.record_worker_result(worker_result)
-            diag.stop_timer('pool_collect')
-        else:
-            diag.stop_timer('pool_collect')
+                        # Entire batch crashed; results will be reported via missing detection.
+                        pass
 
         # Detect any missing results and record them without producing partial Liberty.
         missing_ids = detect_missing_requests(
             requests,
-            [WorkerResult(request_id=request_id, result=result)
-             for request_id, result in results_by_id.items()])
+            [WorkerResult(request_id=point_id, result=result)
+             for point_id, result in results_by_id.items()])
         if missing_ids:
             for request_id in missing_ids:
-                request, _ = request_map[request_id]
+                task_id = request_map[request_id].point.task_id
                 results_by_id[request_id] = MeasurementResult(
-                    point_id=request.point.point_id,
-                    task_id=request.point.task_id,
+                    point_id=request_id,
+                    task_id=task_id,
                     status='error',
-                    error='Result missing after worker execution',
+                    error='Result missing after batch execution',
                 )
             raise RuntimeError(
                 f"Reusable ngspice characterization failed; {len(missing_ids)} result(s) missing: "
@@ -379,7 +287,7 @@ class Characterizer:
             )
 
         # Fail early if any individual point returned an error status.
-        error_ids = [request_id for request_id, result in results_by_id.items()
+        error_ids = [point_id for point_id, result in results_by_id.items()
                      if result.status != 'ok']
         if error_ids:
             raise RuntimeError(
@@ -387,55 +295,25 @@ class Characterizer:
                 f"{error_ids[:10]}"
             )
 
-        # Aggregate per-worker metrics collected from worker results.
-        diag.finalize_worker_counts()
-
         # Deterministic final assembly ordered by point_id.
-        diag.start_timer('assembly')
         assembler = LibertyAssembler()
         assembler.add_results(list(results_by_id.values()))
         ordered_results = assembler.ordered_results()
 
-        groups = defaultdict(list)
+        # Map each ordered result back to its original group_id for assembly.
+        groups_map = defaultdict(list)
         for result in ordered_results:
-            _, group_id = request_map[result.point_id]
-            groups[group_id].append(result)
+            group_id = point_to_group_id.get(result.point_id)
+            if group_id is not None:
+                groups_map[group_id].append(result)
 
-        for group_id, results in groups.items():
+        for group_id, results in groups_map.items():
             cell, config, variation, path, criterion_func = group_info[group_id]
             reduced = reduce_condition_results(results, criterion_func)
             assemble_delay_liberty(cell, config, self.settings, variation, path, reduced)
 
         for cell, config in cells_to_process:
             self.library.add_group(cell.liberty)
-        diag.stop_timer('assembly')
-        diag.record_rss('after_assembly')
-
-        # Legacy fallback for non-delay procedures
-        diag.start_timer('legacy_fallback')
-        legacy_tasks = []
-        for cell, config in self.cells:
-            if cell.is_sequential:
-                # Sequential: all procedures via legacy
-                tasks = self.analyse_cell(cell, config)
-            else:
-                # Combinational: only non-delay procedures via legacy
-                tasks = [t for t in self.analyse_cell(cell, config)
-                         if t[0].__name__ not in ('combinational_worst_case', 'combinational_average')]
-            legacy_tasks.extend(tasks)
-
-        if legacy_tasks:
-            with ProcessPoolExecutor(max_workers=self.settings.jobs) as executor:
-                futures = {executor.submit(t[0], *t[1:]): i for i, t in enumerate(legacy_tasks)}
-                for future in as_completed(futures):
-                    try:
-                        cell_group = future.result()
-                        self.library.add_group(cell_group)
-                    except ProcedureFailedException:
-                        if self.settings.omit_on_failure:
-                            continue
-                        raise
-        diag.stop_timer('legacy_fallback')
 
         # Post-processing: Fetch generated table templates and add them to the library
         lut_templates = []
@@ -459,9 +337,6 @@ class Characterizer:
                         fig.savefig(fig_path / f'{related_pin} to {pin} delay.png')
                         plt.close()
 
-        diag.save()
-        return self.library.to_liberty(precision=6)
-
 
 class CharacterizationSettings:
     """Container for characterization settings"""
@@ -478,7 +353,6 @@ class CharacterizationSettings:
         self.omit_on_failure = kwargs.get('omit_on_failure', False)
         self.execution_engine = kwargs.get('execution_engine',
                                            kwargs.get('simulation', {}).get('execution_engine', 'legacy'))
-        self.diagnostics = kwargs.get('diagnostics', False)
 
         # Simulation procedures
         self.simulation = SimulationSettings(**kwargs.get('simulation', {}))
@@ -522,6 +396,7 @@ class CharacterizationSettings:
             'slew_lower_threshold_pct_fall': self.logic_thresholds.low,
             'input_threshold_pct_rise': self.logic_thresholds.rising,
             'input_threshold_pct_fall': self.logic_thresholds.falling,
+            'output_threshold_pct_rise': self.logic_thresholds.rising,
             'output_threshold_pct_rise': self.logic_thresholds.rising,
             'output_threshold_pct_fall': self.logic_thresholds.falling,
         }

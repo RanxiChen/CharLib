@@ -74,6 +74,31 @@ class MeasurementResult:
     deck_load_count: int = 1
 
 
+@dataclass(frozen=True)
+class SignatureGroup:
+    """All simulation points that share a single topology signature/deck load.
+
+    sweep_points share the same signature and deck; only alterable sweep values
+    (load, temperature) differ between points.
+    """
+    signature: TopologySignature
+    deck_text: str
+    measurement_names: Tuple[str, ...]
+    sweep_points: Tuple['SimulationPoint', ...]
+
+
+@dataclass(frozen=True)
+class WorkerBatchRequest:
+    """Pure-data batch request sent from parent to worker process.
+
+    Contains ONLY primitives, tuples, SimulationPoint references and
+    SignatureGroups. NO Cell, Config, Settings, PySpice, Liberty, or
+    NgSpiceShared objects.
+    """
+    batch_id: str
+    groups: Tuple[SignatureGroup, ...]
+
+
 class LibertyAssembler:
     """Deterministic collector. Receives MeasurementResults, orders by point_id."""
 
@@ -103,11 +128,6 @@ class WorkerContext:
         self._current_signature = None
         self._quarantined_signatures = set()
         self._deck_load_count = 0
-        self._reset_count = 0
-        self._alter_count = 0
-        self._run_count = 0
-        self._extract_count = 0
-        self._signature_switch_count = 0
 
     @property
     def is_loaded(self):
@@ -117,7 +137,8 @@ class WorkerContext:
     def deck_load_count(self):
         return self._deck_load_count
 
-    def _signature_load_key(self, signature):
+    @staticmethod
+    def _signature_load_key(signature):
         """Compute a hashable key for signature matching.
         Excludes alterable fields: load, temperature."""
         return (getattr(signature, 'cell_hash', ''),
@@ -152,9 +173,6 @@ class WorkerContext:
             if self._shared is None:
                 from PySpice.Spice.NgSpice.Shared import NgSpiceShared
                 self._shared = NgSpiceShared()
-            # Count a signature switch when we already had a different signature loaded.
-            if self.is_loaded and self._signature_load_key(self._current_signature) != self._signature_load_key(signature):
-                self._signature_switch_count += 1
             self._shared.load_circuit(deck_text)
             self._current_signature = signature
             self._deck_load_count += 1
@@ -168,18 +186,14 @@ class WorkerContext:
         if not self.is_loaded:
             raise RuntimeError("No circuit loaded")
         self._shared.reset()
-        self._reset_count += 1
         self._shared.exec_command(f'alter c{str(output_pin).lower()} c={load}')
         self._shared.exec_command(f'set temp={temperature}')
-        self._alter_count += 2
 
     def run_and_extract(self):
         """Run and return measurement dict {name: float}."""
         if not self.is_loaded:
             raise RuntimeError("No circuit loaded")
-        self._run_count += 1
         raw = self._shared.run()
-        self._extract_count += 1
         return {k: float(v) for k, v in raw.items()}
 
     def discard(self):
@@ -261,15 +275,20 @@ class WorkerResult:
     request_id: str
     result: MeasurementResult
     worker_id: int = 0
-    worker_pid: int = -1
     worker_deck_load_count: int = 0
-    worker_context_create_count: int = 0
-    worker_reset_count: int = 0
-    worker_alter_count: int = 0
-    worker_run_count: int = 0
-    worker_extract_count: int = 0
-    worker_signature_switch_count: int = 0
     worker_error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class WorkerBatchResult:
+    """Pure-data batch result sent from worker back to parent.
+
+    Contains ONLY WorkerResult values and the worker PID.
+    NO PySpice, Liberty, or NgSpiceShared objects.
+    """
+    batch_id: str
+    results: Tuple[WorkerResult, ...]
+    worker_pid: int = 0
 
 
 _worker_context: Optional[WorkerContext] = None
@@ -348,7 +367,7 @@ def execute_request(request: WorkerRequest) -> WorkerResult:
         )
     try:
         was_loaded = _worker_context.ensure_loaded(request.deck_text, request.signature)
-        _worker_context.alter_sweep_values(request.point.load, request.point.temperature, request.point.output_pin)
+        _worker_context.alter_sweep_values(request.point.load, request.point.temperature)
         measurements = _worker_context.run_and_extract()
 
         mresult = MeasurementResult(
@@ -364,14 +383,7 @@ def execute_request(request: WorkerRequest) -> WorkerResult:
             request_id=request.request_id,
             result=mresult,
             worker_id=_worker_id,
-            worker_pid=_os.getpid(),
             worker_deck_load_count=_worker_context.deck_load_count,
-            worker_context_create_count=1,
-            worker_reset_count=_worker_context._reset_count,
-            worker_alter_count=_worker_context._alter_count,
-            worker_run_count=_worker_context._run_count,
-            worker_extract_count=_worker_context._extract_count,
-            worker_signature_switch_count=_worker_context._signature_switch_count,
         )
     except Exception as e:
         return WorkerResult(
@@ -383,13 +395,110 @@ def execute_request(request: WorkerRequest) -> WorkerResult:
                 error=str(e),
             ),
             worker_id=_worker_id,
-            worker_pid=_os.getpid() if _worker_context else -1,
             worker_deck_load_count=_worker_context.deck_load_count if _worker_context else 0,
-            worker_context_create_count=1 if _worker_context else 0,
-            worker_reset_count=_worker_context._reset_count if _worker_context else 0,
-            worker_alter_count=_worker_context._alter_count if _worker_context else 0,
-            worker_run_count=_worker_context._run_count if _worker_context else 0,
-            worker_extract_count=_worker_context._extract_count if _worker_context else 0,
-            worker_signature_switch_count=_worker_context._signature_switch_count if _worker_context else 0,
             worker_error=str(e),
         )
+
+
+def lpt_batch_groups(signature_groups, num_workers):
+    """Pack SignatureGroups into at most 4*N batches using LPT bin-packing.
+
+    Groups are sorted by point count descending (Longest Processing Time first),
+    then assigned to the batch with the smallest current workload. This keeps
+    the maximum batch size small and keeps all workers busy. The number of
+    batches is between 1 and 4*num_workers; if there are fewer groups than
+    4*num_workers, each group becomes its own batch.
+
+    Returns a list of lists, where each inner list is a batch of SignatureGroups.
+    """
+    max_batches = max(1, 4 * num_workers)
+    groups = sorted(signature_groups, key=lambda g: len(g.sweep_points), reverse=True)
+    num_groups = len(groups)
+    num_batches = min(num_groups, max_batches)
+    if num_batches <= 0:
+        return []
+    batches = [[] for _ in range(num_batches)]
+    batch_sizes = [0 for _ in range(num_batches)]
+    for group in groups:
+        min_index = min(range(num_batches), key=lambda i: batch_sizes[i])
+        batches[min_index].append(group)
+        batch_sizes[min_index] += len(group.sweep_points)
+    return batches
+
+
+def execute_batch(request: WorkerBatchRequest) -> WorkerBatchResult:
+    """Execute a WorkerBatchRequest using the per-process WorkerContext.
+
+    Runs all SignatureGroups sequentially. For each group the deck is loaded once,
+    then for each sweep point the alterable values are applied and the simulation
+    is run. Returns only the requested measurement names for each point.
+    """
+    if _worker_context is None:
+        return WorkerBatchResult(
+            batch_id=request.batch_id,
+            results=(),
+            worker_pid=_os.getpid(),
+        )
+
+    results: list = []
+    for group in request.groups:
+        try:
+            _worker_context.ensure_loaded(group.deck_text, group.signature)
+        except Exception as exc:
+            for point in group.sweep_points:
+                results.append(WorkerResult(
+                    request_id=point.point_id,
+                    result=MeasurementResult(
+                        point_id=point.point_id,
+                        task_id=point.task_id,
+                        signature=group.signature,
+                        status='error',
+                        error=str(exc),
+                    ),
+                    worker_id=_worker_id,
+                    worker_deck_load_count=_worker_context.deck_load_count,
+                    worker_error=str(exc),
+                ))
+            continue
+
+        for point in group.sweep_points:
+            try:
+                _worker_context.alter_sweep_values(point.load, point.temperature, point.output_pin)
+                raw_measurements = _worker_context.run_and_extract()
+                compact = {
+                    name: float(raw_measurements[name])
+                    for name in group.measurement_names
+                    if name in raw_measurements
+                }
+                results.append(WorkerResult(
+                    request_id=point.point_id,
+                    result=MeasurementResult(
+                        point_id=point.point_id,
+                        task_id=point.task_id,
+                        signature=group.signature,
+                        measurement=compact,
+                        status='ok',
+                    ),
+                    worker_id=_worker_id,
+                    worker_deck_load_count=_worker_context.deck_load_count,
+                ))
+            except Exception as exc:
+                results.append(WorkerResult(
+                    request_id=point.point_id,
+                    result=MeasurementResult(
+                        point_id=point.point_id,
+                        task_id=point.task_id,
+                        signature=group.signature,
+                        status='error',
+                        error=str(exc),
+                    ),
+                    worker_id=_worker_id,
+                    worker_deck_load_count=_worker_context.deck_load_count,
+                    worker_error=str(exc),
+                ))
+
+    return WorkerBatchResult(
+        batch_id=request.batch_id,
+        results=tuple(results),
+        worker_pid=_os.getpid(),
+    )
