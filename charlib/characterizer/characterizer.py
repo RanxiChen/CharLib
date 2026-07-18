@@ -276,6 +276,30 @@ class Characterizer:
         for cell, config in cells_to_process:
             self.library.add_group(cell.liberty)
 
+        # Legacy fallback for non-delay procedures
+        legacy_tasks = []
+        for cell, config in self.cells:
+            if cell.is_sequential:
+                # Sequential: all procedures via legacy
+                tasks = self.analyse_cell(cell, config)
+            else:
+                # Combinational: only non-delay procedures via legacy
+                tasks = [t for t in self.analyse_cell(cell, config)
+                         if t[0].__name__ not in ('combinational_worst_case', 'combinational_average')]
+            legacy_tasks.extend(tasks)
+
+        if legacy_tasks:
+            with ProcessPoolExecutor(max_workers=self.settings.jobs) as executor:
+                futures = {executor.submit(t[0], *t[1:]): i for i, t in enumerate(legacy_tasks)}
+                for future in as_completed(futures):
+                    try:
+                        cell_group = future.result()
+                        self.library.add_group(cell_group)
+                    except ProcedureFailedException:
+                        if self.settings.omit_on_failure:
+                            continue
+                        raise
+
         # Post-processing: Fetch generated table templates and add them to the library
         lut_templates = []
         for timing_group in self.library.subgroups_with_name('timing'):
