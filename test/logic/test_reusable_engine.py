@@ -635,3 +635,27 @@ def test_lpt_batch_groups_same_signature_not_split():
     batches = lpt_batch_groups([group], num_workers=4)
     assert len(batches) == 1
     assert batches[0][0] is group
+
+
+def test_jobs_missing_uses_multithreaded_default():
+    """When jobs is not in kwargs, multithreaded default (None) is used."""
+    from charlib.characterizer.characterizer import CharacterizationSettings
+    s = CharacterizationSettings()
+    assert s.jobs is None, f"Expected None (multithreaded default), got {s.jobs}"
+
+
+def test_jobs_explicit_value_passed_through():
+    """Explicit jobs=4 reaches CharacterizationSettings.jobs."""
+    from charlib.characterizer.characterizer import CharacterizationSettings
+    for val in [1, 4, 8, None]:
+        s = CharacterizationSettings(jobs=val)
+        assert s.jobs == val, f"Expected jobs={val}, got {s.jobs}"
+
+
+def test_jobs_explicit_zero_not_silently_dropped():
+    """Explicit jobs=0 is preserved, not silently replaced by multithreaded."""
+    from charlib.characterizer.characterizer import CharacterizationSettings
+    s = CharacterizationSettings(jobs=0)
+    assert s.jobs == 0, "jobs=0 must not be silently replaced"
+
+

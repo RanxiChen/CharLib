@@ -343,7 +343,10 @@ class CharacterizationSettings:
     def __init__(self, **kwargs):
         """Create a new CharacterizationSettings instance"""
         # Behavioral settings
-        self.jobs = None if kwargs.pop('multithreaded', True) else 1
+        if 'jobs' in kwargs:
+            self.jobs = kwargs.pop('jobs')
+        else:
+            self.jobs = None if kwargs.pop('multithreaded', True) else 1
         self.results_dir = Path(kwargs.pop('results_dir', 'results'))
         self.plots_dir = self.results_dir / 'plots'
         self.debug = kwargs.pop('debug', False)
