@@ -5,12 +5,14 @@ from pathlib import Path
 from tqdm import tqdm
 
 import matplotlib.pyplot as plt
+import time
 
 from charlib.characterizer import utils, plots
 from charlib.characterizer.cell import Cell, CellTestConfig
 from charlib.characterizer.units import UnitsSettings
 from charlib.characterizer.procedures import registered_procedures, ProcedureFailedException
 from charlib.liberty.library import Library
+from charlib.characterizer.scheduler import TaskRecord, TaskResult, SchedulerMetrics
 
 import charlib.characterizer.procedures.pin_capacitance.ac_sweep
 import charlib.characterizer.procedures.pin_capacitance.charge_integration
@@ -83,20 +85,44 @@ class Characterizer:
         for (cell, config) in self.cells:
             simulation_tasks += self.analyse_cell(cell, config)
 
+        # Wrap raw tasks in TaskRecord objects for scheduler tracking
+        records = []
+        for i, (task_fn, *task_args) in enumerate(simulation_tasks):
+            proc = f"{task_fn.__module__}.{task_fn.__qualname__}"
+            records.append(TaskRecord(task_id=i, callable=task_fn, args=tuple(task_args), procedure=proc))
+
+        # Scheduler metrics are collected but not used to alter output in S1
+        metrics = SchedulerMetrics(
+            task_count=len(simulation_tasks),
+            future_count=len(simulation_tasks),
+        )
+
         # Run all simulation jobs and merge each resulting liberty cell group into the library
         with tqdm(bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                   total=len(simulation_tasks), desc="Characterizing") as progress_bar:
             with ProcessPoolExecutor(max_workers=self.settings.jobs) as executor:
-                futures = [executor.submit(task, *args) for (task, *args) in simulation_tasks]
+                submit_start = time.perf_counter()
+                futures = [executor.submit(record.callable, *record.args) for record in records]
+                future_to_record = {future: record for future, record in zip(futures, records)}
+                metrics.submit_seconds = time.perf_counter() - submit_start
+
                 for future in as_completed(futures):
+                    record = future_to_record[future]
                     try:
-                        cell_group = future.result()
-                    except ProcedureFailedException:
-                        if self.settings.omit_on_failure:
+                        value = future.result()
+                        result = TaskResult(task_id=record.task_id, value=value)
+                    except Exception as e:
+                        result = TaskResult(
+                            task_id=record.task_id,
+                            error_type=type(e).__name__,
+                            error_message=str(e),
+                        )
+                        if self.settings.omit_on_failure and isinstance(e, ProcedureFailedException):
                             continue
-                        else:
-                            raise
-                    self.library.add_group(cell_group)
+                        raise
+                    merge_start = time.perf_counter()
+                    self.library.add_group(result.value)
+                    metrics.merge_seconds += time.perf_counter() - merge_start
                     progress_bar.update(1)
 
         # Post-processing: Fetch generated table templates and add them to the library
