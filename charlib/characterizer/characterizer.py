@@ -6,6 +6,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import time
 import os
+import signal
 
 from charlib.characterizer import utils, plots
 from charlib.characterizer.cell import Cell, CellTestConfig
@@ -79,13 +80,52 @@ class Characterizer:
             simulations += self.settings.simulation.combinational_leakage(cell, config, self.settings)
         return simulations
 
+    def _unfinished_task_ids(self, records, all_results):
+        """Return sorted list of task IDs in records that are not present in all_results."""
+        finished = {r.task_id for r in all_results}
+        return sorted(record.task_id for record in records if record.task_id not in finished)
+
+    def _apply_batched_results(self, all_results, records, omit_on_failure):
+        """Deterministic merge with duplicate/missing ID checks and omit_on_failure handling."""
+        all_results.sort(key=lambda r: r.task_id)
+        ids = [r.task_id for r in all_results]
+        if len(ids) != len(set(ids)):
+            from collections import Counter
+            dupes = [tid for tid, count in Counter(ids).items() if count > 1]
+            raise RuntimeError(f"Duplicate task IDs in batch results: {dupes}")
+        expected = set(range(len(records)))
+        actual = set(ids)
+        if expected != actual:
+            missing = expected - actual
+            extra = actual - expected
+            raise RuntimeError(
+                f"Task ID mismatch: missing={sorted(missing)}, extra={sorted(extra)}"
+            )
+
+        if omit_on_failure:
+            # Apply only successful results
+            for r in all_results:
+                if r.error_type is None and r.value is not None:
+                    self.library.add_group(r.value)
+        else:
+            # Fail on first error
+            for r in all_results:
+                if r.error_type is not None:
+                    raise RuntimeError(
+                        f"Task {r.task_id} failed: {r.error_type}: {r.error_message}"
+                    )
+            # All successful — apply all
+            for r in all_results:
+                self.library.add_group(r.value)
+
     def _characterize_batched(self, records, progress_bar, metrics):
         """Execute TaskRecords using cost-ordered micro-batches.
 
-        Activated when the environment variable ``CHARLIB_S2_BATCHED`` is set to ``1``.
+        Activated when ``settings.simulation.execution_engine`` is ``batched``.
         """
         workers = self.settings.jobs or os.cpu_count() or 4
-        batch_factor = 4
+        batch_factor = self.settings.simulation.scheduler_batch_factor
+        max_inflight_per_worker = self.settings.simulation.scheduler_max_inflight_per_worker
 
         submit_start = time.perf_counter()
         batches = plan_batches(records, workers, batch_factor=batch_factor)
@@ -95,15 +135,29 @@ class Characterizer:
         future_to_batch = {}
         pending = set()
         all_results = []
+        interrupted = False
 
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            # Seed the pool with up to 2*workers batches
-            max_in_flight = max(1, 2 * workers)
+        old_sigterm = None
+
+        def _handle_sigterm(signum, frame):
+            nonlocal interrupted
+            interrupted = True
+            raise KeyboardInterrupt()
+
+        if hasattr(signal, 'SIGTERM'):
+            old_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
+
+        executor = None
+        try:
+            executor = ProcessPoolExecutor(max_workers=workers)
+            max_in_flight = max(1, max_inflight_per_worker * workers)
             batch_iter = iter(batches)
             for _ in range(min(len(batches), max_in_flight)):
                 try:
                     batch = next(batch_iter)
                 except StopIteration:
+                    break
+                if interrupted:
                     break
                 fut = executor.submit(execute_batch, batch)
                 future_to_batch[fut] = batch
@@ -112,15 +166,31 @@ class Characterizer:
             metrics.submit_seconds = time.perf_counter() - submit_start
             collect_start = time.perf_counter()
 
-            while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            while pending and not interrupted:
+                try:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                except KeyboardInterrupt:
+                    interrupted = True
+                    break
                 for fut in done:
-                    batch = future_to_batch.pop(fut)
-                    batch_result = fut.result()
-                    all_results.extend(batch_result.task_results)
-                    progress_bar.update(len(batch.tasks))
+                    batch = future_to_batch.pop(fut, None)
+                    try:
+                        batch_result = fut.result()
+                        all_results.extend(batch_result.task_results)
+                        progress_bar.update(len(batch.tasks))
+                    except Exception as e:
+                        # The future itself failed (e.g., worker crash). Record an error
+                        # for every task in the batch so deterministic merge can report it.
+                        if batch is not None:
+                            progress_bar.update(len(batch.tasks))
+                            for record in batch.tasks:
+                                all_results.append(TaskResult(
+                                    task_id=record.task_id,
+                                    error_type=type(e).__name__,
+                                    error_message=str(e),
+                                ))
                 # Keep the pipeline full
-                while len(pending) < max_in_flight:
+                while len(pending) < max_in_flight and not interrupted:
                     try:
                         batch = next(batch_iter)
                     except StopIteration:
@@ -130,16 +200,28 @@ class Characterizer:
                     pending.add(fut)
 
             metrics.collect_seconds = time.perf_counter() - collect_start
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+            if old_sigterm is not None:
+                try:
+                    signal.signal(signal.SIGTERM, old_sigterm)
+                except ValueError:
+                    # Can fail if called from a non-main thread
+                    pass
 
-        all_results.sort(key=lambda r: r.task_id)
-        for result in all_results:
-            if result.error_type is not None:
-                if self.settings.omit_on_failure and result.error_type == ProcedureFailedException.__name__:
-                    continue
-                raise Exception(result.error_message)
-            merge_start = time.perf_counter()
-            self.library.add_group(result.value)
-            metrics.merge_seconds += time.perf_counter() - merge_start
+        if interrupted:
+            unfinished = self._unfinished_task_ids(records, all_results)
+            raise RuntimeError(
+                f"Characterization interrupted; executor shutdown. "
+                f"Unfinished task IDs: {unfinished}"
+            )
+
+        merge_start = time.perf_counter()
+        self._apply_batched_results(
+            all_results, records, self.settings.omit_on_failure
+        )
+        metrics.merge_seconds += time.perf_counter() - merge_start
 
     def characterize(self):
         """Execute scheduled simulation jobs in parallel"""
@@ -163,7 +245,7 @@ class Characterizer:
         # Run all simulation jobs and merge each resulting liberty cell group into the library
         with tqdm(bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                   total=len(simulation_tasks), desc="Characterizing") as progress_bar:
-            if os.environ.get('CHARLIB_S2_BATCHED') == '1':
+            if self.settings.simulation.execution_engine == 'batched':
                 self._characterize_batched(records, progress_bar, metrics)
             else:
                 with ProcessPoolExecutor(max_workers=self.settings.jobs) as executor:
@@ -197,6 +279,18 @@ class Characterizer:
             lut_templates += [lut_group.template for lut_group in timing_group.groups.values()]
         [self.library.add_group(lut_template) for lut_template in lut_templates]
 
+        liberty = self.library.to_liberty(precision=6)
+
+        # Optionally write scheduler metrics to an explicit artifact path, never into Liberty.
+        metrics_path = getattr(self.settings, 'scheduler_metrics_path', None)
+        if metrics_path:
+            from dataclasses import asdict
+            import json
+            metrics_path = Path(metrics_path)
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(metrics_path, 'w') as f:
+                json.dump(asdict(metrics), f, indent=2)
+
         # Plot delay surfaces (if desired)
         for (cell, config) in self.cells:
             cell_group = self.library.group('cell', cell.name)
@@ -212,7 +306,7 @@ class Characterizer:
                         fig_path.mkdir(parents=True, exist_ok=True)
                         fig.savefig(fig_path / f'{related_pin} to {pin} delay.png') # FIXME: filetype should be configurable
                         plt.close()
-        return self.library.to_liberty(precision=6)
+        return liberty
 
 
 class CharacterizationSettings:
@@ -228,6 +322,7 @@ class CharacterizationSettings:
         self.quiet = kwargs.pop('quiet', False)
         self.cell_defaults = kwargs.get('cell_defaults', {})
         self.omit_on_failure = kwargs.get('omit_on_failure', False)
+        self.scheduler_metrics_path = kwargs.get('scheduler_metrics_path', None)
 
         # Simulation procedures
         self.simulation = SimulationSettings(**kwargs.get('simulation', {}))
@@ -282,28 +377,53 @@ class SimulationSettings:
         self.backend = kwargs.get('backend', 'ngspice-shared')
         self.input_capacitance = registered_procedures[
             kwargs.get('input_capacitance_procedure', 'ac_sweep')
-        ]['callable']
+        ]["callable"]
         self.combinational_delay = registered_procedures[
             kwargs.get('combinational_delay_procedure', 'combinational_worst_case')
-        ]['callable']
+        ]["callable"]
         self.combinational_leakage = registered_procedures[
             kwargs.get('combinational_leakage_procedure', 'combinational_leakage')
-        ]['callable']
+        ]["callable"]
         self.sequential_delay = registered_procedures[
             kwargs.get('sequential_delay_procedure', 'sequential_worst_case')
-        ]['callable']
+        ]["callable"]
         self.metastability_constraint = registered_procedures[
             kwargs.get('setup_hold_constraint_procedure', 'measure_setup_hold_from_contour')
-        ]['callable']
+        ]["callable"]
         self.recovery_constraint = registered_procedures[
             kwargs.get('recovery_constraint_procedure', 'recovery_constraint')
-        ]['callable']
+        ]["callable"]
         self.removal_constraint = registered_procedures[
             kwargs.get('removal_constraint_procedure', 'removal_constraint')
-        ]['callable']
+        ]["callable"]
         self.min_pulse_width_constraint = registered_procedures[
             kwargs.get('min_pulse_width_constraint_procedure', 'min_pulse_width_constraint')
-        ]['callable']
+        ]["callable"]
+
+        # Scheduler configuration (S3)
+        self.execution_engine = kwargs.get('execution_engine', "legacy")
+        self.scheduler_batch_factor = kwargs.get('scheduler_batch_factor', 4)
+        self.scheduler_max_inflight_per_worker = kwargs.get('scheduler_max_inflight_per_worker', 2)
+        self.scheduler_cost_policy = kwargs.get('scheduler_cost_policy', "measured_lpt")
+
+        if self.execution_engine not in ("legacy", "batched"):
+            raise ValueError(
+                f"Invalid execution_engine: {self.execution_engine!r}; "
+                f"must be 'legacy' or 'batched'"
+            )
+        if self.scheduler_batch_factor < 1:
+            raise ValueError(
+                f"scheduler_batch_factor must be >= 1, got {self.scheduler_batch_factor}"
+            )
+        if self.scheduler_max_inflight_per_worker < 1:
+            raise ValueError(
+                f"scheduler_max_inflight_per_worker must be >= 1, got {self.scheduler_max_inflight_per_worker}"
+            )
+        if self.scheduler_cost_policy != "measured_lpt":
+            raise ValueError(
+                f"Invalid scheduler_cost_policy: {self.scheduler_cost_policy!r}; "
+                f"must be 'measured_lpt'"
+            )
 
 
 class LogicThresholds:

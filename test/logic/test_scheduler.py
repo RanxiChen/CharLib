@@ -1,8 +1,13 @@
 import os
-import pickle
 import operator
+import time
+import json
+import tempfile
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
+
 import pytest
+
 from charlib.characterizer.scheduler import (
     TaskRecord,
     TaskResult,
@@ -22,6 +27,11 @@ def dummy_fail(x):
     raise ValueError(f"bad input: {x}")
 
 
+def dummy_slow(x, duration=0.01):
+    time.sleep(duration)
+    return Group('cell', f'cell_{x}')
+
+
 class TestTaskRecord:
     def test_stable_id(self):
         r = TaskRecord(task_id=5, callable=dummy_double, args=(3,), procedure="test.dummy_double")
@@ -33,6 +43,7 @@ class TestTaskRecord:
 
     def test_picklable(self):
         r = TaskRecord(task_id=1, callable=dummy_double, args=(2,), procedure="test.dummy_double")
+        import pickle
         data = pickle.dumps(r)
         r2 = pickle.loads(data)
         assert r2.task_id == 1
@@ -53,6 +64,7 @@ class TestTaskResult:
         assert r.value is None
 
     def test_picklable(self):
+        import pickle
         r = TaskResult(task_id=2, value="hello")
         data = pickle.dumps(r)
         r2 = pickle.loads(data)
@@ -157,6 +169,7 @@ class TestExecuteBatch:
 
 class TestBatchPickling:
     def test_batch_record_pickles(self):
+        import pickle
         records = [
             TaskRecord(task_id=0, callable=dummy_double, args=(2,), procedure="t", cost_hint=1.0)
         ]
@@ -168,6 +181,7 @@ class TestBatchPickling:
         assert b2.tasks[0].args == (2,)
 
     def test_batch_result_pickles(self):
+        import pickle
         results = [TaskResult(task_id=1, value="ok")]
         br = BatchResult(batch_id=2, task_results=results, worker_pid=123, wall_seconds=0.5)
         data = pickle.dumps(br)
@@ -205,3 +219,151 @@ class TestProcessPoolBatching:
             for r in batch_result.task_results
         )
         assert values == [(0, 2), (1, 4), (2, 6)]
+
+
+# ---- S3 tests -----------------------------------------------------------------
+
+from charlib.characterizer.characterizer import Characterizer, SimulationSettings
+from charlib.liberty.liberty import Group
+
+
+class TestExecutionEngineConfig:
+    def test_default_is_legacy(self):
+        s = SimulationSettings()
+        assert s.execution_engine == "legacy"
+
+    def test_valid_batched(self):
+        s = SimulationSettings(execution_engine="batched")
+        assert s.execution_engine == "batched"
+
+    def test_invalid_engine_raises(self):
+        with pytest.raises(ValueError, match="Invalid execution_engine"):
+            SimulationSettings(execution_engine="neither")
+
+    def test_batch_factor_validation(self):
+        with pytest.raises(ValueError, match="scheduler_batch_factor"):
+            SimulationSettings(scheduler_batch_factor=0)
+
+    def test_inflight_validation(self):
+        with pytest.raises(ValueError, match="scheduler_max_inflight_per_worker"):
+            SimulationSettings(scheduler_max_inflight_per_worker=0)
+
+    def test_cost_policy_validation(self):
+        with pytest.raises(ValueError, match="scheduler_cost_policy"):
+            SimulationSettings(scheduler_cost_policy="random")
+
+
+class TestDeterministicMerge:
+    def _make_results(self):
+        return [
+            TaskResult(task_id=2, value=Group('cell', 'c')),
+            TaskResult(task_id=0, value=Group('cell', 'a')),
+            TaskResult(task_id=1, value=Group('cell', 'b')),
+        ]
+
+    def test_sort_by_task_id(self):
+        c = Characterizer(lib_name='test')
+        c._apply_batched_results(self._make_results(), records=[None, None, None], omit_on_failure=False)
+        cells = list(c.library.subgroups_with_name('cell'))
+        assert [g.identifier for g in cells] == ['a', 'b', 'c']
+
+    def test_reject_duplicate_ids(self):
+        c = Characterizer(lib_name='test')
+        results = [
+            TaskResult(task_id=0, value=Group('cell', 'a')),
+            TaskResult(task_id=0, value=Group('cell', 'b')),
+        ]
+        with pytest.raises(RuntimeError, match="Duplicate task IDs"):
+            c._apply_batched_results(results, records=[None, None], omit_on_failure=False)
+
+    def test_reject_missing_ids(self):
+        c = Characterizer(lib_name='test')
+        results = [
+            TaskResult(task_id=0, value=Group('cell', 'a')),
+            TaskResult(task_id=2, value=Group('cell', 'c')),
+        ]
+        with pytest.raises(RuntimeError, match="Task ID mismatch"):
+            c._apply_batched_results(results, records=[None, None, None], omit_on_failure=False)
+
+
+class TestOmitOnFailure:
+    def _make_results(self):
+        return [
+            TaskResult(task_id=0, value=Group('cell', 'a')),
+            TaskResult(task_id=1, error_type='ValueError', error_message='bad'),
+            TaskResult(task_id=2, value=Group('cell', 'c')),
+        ]
+
+    def test_omit_true_skips_failed(self):
+        c = Characterizer(lib_name='test')
+        c._apply_batched_results(self._make_results(), records=[None, None, None], omit_on_failure=True)
+        cells = list(c.library.subgroups_with_name('cell'))
+        assert len(cells) == 2
+        assert {g.identifier for g in cells} == {'a', 'c'}
+
+    def test_omit_false_raises(self):
+        c = Characterizer(lib_name='test')
+        with pytest.raises(RuntimeError, match="Task 1 failed"):
+            c._apply_batched_results(self._make_results(), records=[None, None, None], omit_on_failure=False)
+
+    def test_siblings_survive(self):
+        c = Characterizer(lib_name='test')
+        c._apply_batched_results(self._make_results(), records=[None, None, None], omit_on_failure=True)
+        cells = list(c.library.subgroups_with_name('cell'))
+        assert len(cells) == 2
+
+
+class TestInterruptCleanup:
+    def test_unfinished_task_ids(self):
+        c = Characterizer(lib_name='test')
+        records = [TaskRecord(task_id=i, callable=dummy_double, args=(i,), procedure="t") for i in range(5)]
+        results = [TaskResult(task_id=0, value='a'), TaskResult(task_id=2, value='c')]
+        assert c._unfinished_task_ids(records, results) == [1, 3, 4]
+
+    def test_no_child_processes(self):
+        from charlib.characterizer.characterizer import SchedulerMetrics as _SchedulerMetrics
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'}, jobs=2)
+        records = [
+            TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.01), procedure="t", cost_hint=1.0)
+            for i in range(4)
+        ]
+        # dummy_slow returns a Group so _apply_batched_results can add it
+        metrics = _SchedulerMetrics(task_count=4)
+
+        class _Bar:
+            def update(self, n):
+                pass
+
+        c._characterize_batched(records, _Bar(), metrics)
+        # Give the OS a moment to reap worker processes
+        time.sleep(0.2)
+        assert len(multiprocessing.active_children()) == 0
+
+
+class TestLegacyFallback:
+    def test_legacy_path_unchanged(self):
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'legacy'})
+        assert c.settings.simulation.execution_engine == 'legacy'
+
+    def test_explicit_batched_selection(self):
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'})
+        assert c.settings.simulation.execution_engine == 'batched'
+
+
+class TestMetricsSeparation:
+    def test_metrics_not_in_liberty(self):
+        with tempfile.TemporaryDirectory() as td:
+            metrics_path = os.path.join(td, 'metrics.json')
+            c = Characterizer(
+                lib_name='test',
+                simulation={'execution_engine': 'batched'},
+                scheduler_metrics_path=metrics_path,
+            )
+            liberty = c.characterize()
+            assert os.path.exists(metrics_path)
+            with open(metrics_path) as f:
+                data = json.load(f)
+            assert data['task_count'] == 0
+            assert data['batch_count'] == 0
+            assert 'task_count' not in liberty
+            assert 'batch_count' not in liberty
