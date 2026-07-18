@@ -118,3 +118,62 @@ def test_simulation_point_rejects_runtime_mutation():
     point = _make_point()
     with pytest.raises(dataclasses.FrozenInstanceError):
         point.point_id = "mutated"
+
+
+def test_worker_context_deck_load_count():
+    """Different data_slew produces different load keys (must enter signature)."""
+    from charlib.characterizer.reusable_engine import WorkerContext, TopologySignature
+    ctx = WorkerContext()
+    assert ctx.deck_load_count == 0
+    sig1 = TopologySignature(cell_hash='a', netlist_hash='b', model_hashes=(),
+                             pin_topology=(), state_condition=(),
+                             measurement_names=('cell_rise__a_to_y',),
+                             measurement_directions=(), backend='ngspice',
+                             data_slew=0.015, t_sim_end=3.0,
+                             temperature=25.0, supplies_hash='c')
+    sig2 = TopologySignature(cell_hash='a', netlist_hash='b', model_hashes=(),
+                             pin_topology=(), state_condition=(),
+                             measurement_names=('cell_rise__a_to_y',),
+                             measurement_directions=(), backend='ngspice',
+                             data_slew=0.030, t_sim_end=3.0,
+                             temperature=25.0, supplies_hash='c')
+    assert ctx._signature_load_key(sig1) != ctx._signature_load_key(sig2)
+
+
+def test_worker_context_signature_switching():
+    """Temperature difference excluded from signature → same load key."""
+    from charlib.characterizer.reusable_engine import WorkerContext, TopologySignature
+    ctx = WorkerContext()
+    sig_a = TopologySignature(cell_hash='x', netlist_hash='y', model_hashes=(),
+                              pin_topology=(), state_condition=(),
+                              measurement_names=(), measurement_directions=(),
+                              backend='ngspice', data_slew=0.015,
+                              t_sim_end=3.0, temperature=25.0, supplies_hash='z')
+    sig_b = TopologySignature(cell_hash='x', netlist_hash='y', model_hashes=(),
+                              pin_topology=(), state_condition=(),
+                              measurement_names=(), measurement_directions=(),
+                              backend='ngspice', data_slew=0.015,
+                              t_sim_end=3.0, temperature=80.0, supplies_hash='z')
+    assert ctx._signature_load_key(sig_a) == ctx._signature_load_key(sig_b)
+
+
+def test_worker_context_quarantine():
+    """Quarantined signature key is stored."""
+    from charlib.characterizer.reusable_engine import WorkerContext, TopologySignature
+    ctx = WorkerContext()
+    sig = TopologySignature(cell_hash='a', netlist_hash='b', model_hashes=(),
+                            pin_topology=(), state_condition=(),
+                            measurement_names=(), measurement_directions=(),
+                            backend='ngspice', data_slew=0.015,
+                            t_sim_end=3.0, temperature=25.0, supplies_hash='c')
+    ctx.quarantine_signature(sig)
+    key = ctx._signature_load_key(sig)
+    assert key in ctx._quarantined_signatures
+
+
+def test_worker_context_destruction():
+    """Discard clears loaded state."""
+    from charlib.characterizer.reusable_engine import WorkerContext
+    ctx = WorkerContext()
+    ctx.discard()
+    assert not ctx.is_loaded
