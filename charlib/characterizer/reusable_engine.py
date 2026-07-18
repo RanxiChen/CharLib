@@ -103,6 +103,11 @@ class WorkerContext:
         self._current_signature = None
         self._quarantined_signatures = set()
         self._deck_load_count = 0
+        self._reset_count = 0
+        self._alter_count = 0
+        self._run_count = 0
+        self._extract_count = 0
+        self._signature_switch_count = 0
 
     @property
     def is_loaded(self):
@@ -147,6 +152,9 @@ class WorkerContext:
             if self._shared is None:
                 from PySpice.Spice.NgSpice.Shared import NgSpiceShared
                 self._shared = NgSpiceShared()
+            # Count a signature switch when we already had a different signature loaded.
+            if self.is_loaded and self._signature_load_key(self._current_signature) != self._signature_load_key(signature):
+                self._signature_switch_count += 1
             self._shared.load_circuit(deck_text)
             self._current_signature = signature
             self._deck_load_count += 1
@@ -160,14 +168,18 @@ class WorkerContext:
         if not self.is_loaded:
             raise RuntimeError("No circuit loaded")
         self._shared.reset()
+        self._reset_count += 1
         self._shared.exec_command(f'alter c{str(output_pin).lower()} c={load}')
         self._shared.exec_command(f'set temp={temperature}')
+        self._alter_count += 2
 
     def run_and_extract(self):
         """Run and return measurement dict {name: float}."""
         if not self.is_loaded:
             raise RuntimeError("No circuit loaded")
+        self._run_count += 1
         raw = self._shared.run()
+        self._extract_count += 1
         return {k: float(v) for k, v in raw.items()}
 
     def discard(self):
@@ -249,7 +261,14 @@ class WorkerResult:
     request_id: str
     result: MeasurementResult
     worker_id: int = 0
+    worker_pid: int = -1
     worker_deck_load_count: int = 0
+    worker_context_create_count: int = 0
+    worker_reset_count: int = 0
+    worker_alter_count: int = 0
+    worker_run_count: int = 0
+    worker_extract_count: int = 0
+    worker_signature_switch_count: int = 0
     worker_error: Optional[str] = None
 
 
@@ -345,7 +364,14 @@ def execute_request(request: WorkerRequest) -> WorkerResult:
             request_id=request.request_id,
             result=mresult,
             worker_id=_worker_id,
+            worker_pid=_os.getpid(),
             worker_deck_load_count=_worker_context.deck_load_count,
+            worker_context_create_count=1,
+            worker_reset_count=_worker_context._reset_count,
+            worker_alter_count=_worker_context._alter_count,
+            worker_run_count=_worker_context._run_count,
+            worker_extract_count=_worker_context._extract_count,
+            worker_signature_switch_count=_worker_context._signature_switch_count,
         )
     except Exception as e:
         return WorkerResult(
@@ -357,6 +383,13 @@ def execute_request(request: WorkerRequest) -> WorkerResult:
                 error=str(e),
             ),
             worker_id=_worker_id,
+            worker_pid=_os.getpid() if _worker_context else -1,
             worker_deck_load_count=_worker_context.deck_load_count if _worker_context else 0,
+            worker_context_create_count=1 if _worker_context else 0,
+            worker_reset_count=_worker_context._reset_count if _worker_context else 0,
+            worker_alter_count=_worker_context._alter_count if _worker_context else 0,
+            worker_run_count=_worker_context._run_count if _worker_context else 0,
+            worker_extract_count=_worker_context._extract_count if _worker_context else 0,
+            worker_signature_switch_count=_worker_context._signature_switch_count if _worker_context else 0,
             worker_error=str(e),
         )
