@@ -129,6 +129,10 @@ class Characterizer:
         batch_factor = self.settings.simulation.scheduler_batch_factor
         max_inflight_per_worker = self.settings.simulation.scheduler_max_inflight_per_worker
 
+        metrics.requested_jobs = self.settings.jobs
+        metrics.resolved_max_workers = workers
+        metrics.max_in_flight = max_inflight_per_worker * workers
+
         submit_start = time.perf_counter()
         batches = plan_batches(records, workers, batch_factor=batch_factor)
         metrics.batch_count = len(batches)
@@ -137,6 +141,7 @@ class Characterizer:
         future_to_batch = {}
         pending = set()
         all_results = []
+        all_batch_results = []
         interrupted = False
 
         old_sigterm = None
@@ -180,6 +185,7 @@ class Characterizer:
                     try:
                         batch_result = fut.result()
                         all_results.extend(batch_result.task_results)
+                        all_batch_results.append(batch_result)
                         progress_bar.update(len(batch.tasks))
                     except Exception as e:
                         # The future itself failed (e.g., worker crash). Record an error
@@ -234,6 +240,52 @@ class Characterizer:
                 f"Unfinished task IDs: {unfinished}"
             )
 
+        # Aggregate per-worker and per-batch metrics now that all batches finished.
+        worker_pids = sorted(set(r.worker_pid for r in all_batch_results))
+        per_worker_task_count = {str(pid): sum(len(r.task_results) for r in all_batch_results if r.worker_pid == pid) for pid in worker_pids}
+        per_worker_batch_count = {str(pid): sum(1 for r in all_batch_results if r.worker_pid == pid) for pid in worker_pids}
+        per_worker_wall_seconds = {str(pid): sum(r.wall_seconds for r in all_batch_results if r.worker_pid == pid) for pid in worker_pids}
+        batch_records = [
+            {
+                'batch_id': r.batch_id,
+                'worker_pid': r.worker_pid,
+                'wall_seconds': r.wall_seconds,
+                'predicted_cost': r.predicted_cost,
+                'task_count': len(r.task_results),
+                'task_ids': r.task_ids,
+            }
+            for r in all_batch_results
+        ]
+        record_by_task_id = {record.task_id: record for record in records}
+        task_records = [
+            {
+                'task_id': tr.task_id,
+                'procedure': record_by_task_id[tr.task_id].procedure,
+                'cell': record_by_task_id[tr.task_id].cell,
+                'batch_id': r.batch_id,
+                'worker_pid': r.worker_pid,
+                'wall_seconds': tr.task_wall_seconds,
+                'error_type': tr.error_type,
+            }
+            for r in all_batch_results
+            for tr in r.task_results
+        ]
+        metrics.worker_pids = worker_pids
+        metrics.per_worker_task_count = per_worker_task_count
+        metrics.per_worker_batch_count = per_worker_batch_count
+        metrics.per_worker_wall_seconds = per_worker_wall_seconds
+        metrics.batch_records = sorted(batch_records, key=lambda b: b['batch_id'])
+        metrics.task_records = sorted(task_records, key=lambda t: t['task_id'])
+
+        metrics_path = getattr(self.settings, 'scheduler_metrics_path', None)
+        if metrics_path:
+            from dataclasses import asdict
+            import json
+            metrics_path = Path(metrics_path)
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(metrics_path, 'w') as f:
+                json.dump(asdict(metrics), f, sort_keys=True)
+
         merge_start = time.perf_counter()
         self._apply_batched_results(
             all_results, records, self.settings.omit_on_failure
@@ -265,6 +317,9 @@ class Characterizer:
             if self.settings.simulation.execution_engine == 'batched':
                 self._characterize_batched(records, progress_bar, metrics)
             else:
+                metrics.requested_jobs = self.settings.jobs
+                metrics.resolved_max_workers = self.settings.jobs or os.cpu_count() or 4
+                metrics.worker_pids = []
                 with ProcessPoolExecutor(max_workers=self.settings.jobs) as executor:
                     submit_start = time.perf_counter()
                     futures = [executor.submit(record.callable, *record.args) for record in records]
@@ -306,7 +361,7 @@ class Characterizer:
             metrics_path = Path(metrics_path)
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
             with open(metrics_path, 'w') as f:
-                json.dump(asdict(metrics), f, indent=2)
+                json.dump(asdict(metrics), f, sort_keys=True)
 
         # Plot delay surfaces (if desired)
         for (cell, config) in self.cells:

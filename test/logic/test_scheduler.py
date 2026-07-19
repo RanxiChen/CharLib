@@ -5,6 +5,7 @@ import json
 import signal
 import tempfile
 import multiprocessing
+from dataclasses import asdict
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
@@ -187,7 +188,8 @@ class TestBatchPickling:
     def test_batch_result_pickles(self):
         import pickle
         results = [TaskResult(task_id=1, value="ok")]
-        br = BatchResult(batch_id=2, task_results=results, worker_pid=123, wall_seconds=0.5)
+        br = BatchResult(batch_id=2, task_results=results, worker_pid=123, wall_seconds=0.5,
+                         predicted_cost=1.0, task_ids=[1])
         data = pickle.dumps(br)
         br2 = pickle.loads(data)
         assert br2.batch_id == 2
@@ -512,3 +514,87 @@ class TestWorkerScaling:
         identifiers_j8 = self._run_batched(8)
         assert identifiers_j1 == ['cell_0', 'cell_1', 'cell_2', 'cell_3']
         assert identifiers_j8 == identifiers_j1
+
+
+class TestMetricsExtended:
+    def test_execute_batch_records_per_task_wall_and_pid(self):
+        records = [
+            TaskRecord(task_id=0, callable=dummy_double, args=(3,), procedure="t", cost_hint=1.0),
+            TaskRecord(task_id=1, callable=dummy_double, args=(4,), procedure="t", cost_hint=1.0),
+        ]
+        batch = BatchRecord(batch_id=7, tasks=records, predicted_cost=2.0)
+        result = execute_batch(batch)
+        assert result.worker_pid == os.getpid()
+        assert all(r.worker_pid == result.worker_pid for r in result.task_results)
+        assert all(r.task_wall_seconds >= 0.0 for r in result.task_results)
+        assert sum(r.task_wall_seconds for r in result.task_results) <= result.wall_seconds
+
+    def test_error_task_has_metrics(self):
+        record = TaskRecord(task_id=5, callable=dummy_fail, args=(7,), procedure="t", cost_hint=1.0)
+        batch = BatchRecord(batch_id=0, tasks=[record], predicted_cost=1.0)
+        result = execute_batch(batch)
+        tr = result.task_results[0]
+        assert tr.task_wall_seconds >= 0.0
+        assert tr.worker_pid > 0
+        assert tr.error_type == "ValueError"
+        assert "bad input: 7" in tr.error_message
+
+    def test_batch_result_has_predicted_cost_and_task_ids(self):
+        records = [
+            TaskRecord(task_id=0, callable=dummy_double, args=(3,), procedure="t", cost_hint=1.0),
+            TaskRecord(task_id=1, callable=dummy_double, args=(4,), procedure="t", cost_hint=1.0),
+        ]
+        batch = BatchRecord(batch_id=2, tasks=records, predicted_cost=2.5)
+        result = execute_batch(batch)
+        assert result.predicted_cost == 2.5
+        assert result.task_ids == [0, 1]
+
+    def test_metrics_json_roundtrip(self):
+        m = SchedulerMetrics(
+            task_count=2,
+            requested_jobs=4,
+            resolved_max_workers=2,
+            max_in_flight=4,
+            worker_pids=[100, 200],
+            per_worker_task_count={"100": 1, "200": 1},
+            batch_records=[{"batch_id": 0, "task_count": 2}],
+            task_records=[{"task_id": 0, "procedure": "p"}],
+        )
+        dumped = json.dumps(asdict(m))
+        loaded = json.loads(dumped)
+        assert "requested_jobs" in loaded
+        assert "resolved_max_workers" in loaded
+        assert "max_in_flight" in loaded
+        assert "worker_pids" in loaded
+        assert "per_worker_task_count" in loaded
+        assert "per_worker_batch_count" in loaded
+        assert "per_worker_wall_seconds" in loaded
+        assert "batch_records" in loaded
+        assert "task_records" in loaded
+        assert loaded["requested_jobs"] == 4
+
+    def test_stable_sorting(self):
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'}, jobs=2)
+        records = [
+            TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.001), procedure="t", cost_hint=1.0)
+            for i in range(4)
+        ]
+        from charlib.characterizer.characterizer import SchedulerMetrics
+        metrics = SchedulerMetrics(task_count=4)
+
+        class _Bar:
+            def update(self, n):
+                pass
+
+        c._characterize_batched(records, _Bar(), metrics)
+        assert metrics.worker_pids == sorted(metrics.worker_pids)
+        assert [b["batch_id"] for b in metrics.batch_records] == sorted(b["batch_id"] for b in metrics.batch_records)
+        assert [t["task_id"] for t in metrics.task_records] == sorted(t["task_id"] for t in metrics.task_records)
+
+    def test_metrics_default_factories_no_shared_state(self):
+        m1 = SchedulerMetrics()
+        m2 = SchedulerMetrics()
+        m1.worker_pids.append(123)
+        m1.batch_records.append({"batch_id": 0})
+        assert m2.worker_pids == []
+        assert m2.batch_records == []

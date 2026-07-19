@@ -31,6 +31,8 @@ class TaskResult:
     error_type: Optional[str] = None
     error_message: Optional[str] = None
     exception: Optional[Exception] = None
+    task_wall_seconds: float = 0.0
+    worker_pid: int = 0
     metrics: Optional['SchedulerMetrics'] = None
 
 
@@ -44,6 +46,15 @@ class SchedulerMetrics:
     collect_seconds: float = 0.0
     merge_seconds: float = 0.0
     ipc_estimate_bytes: int = 0
+    requested_jobs: int = 0
+    resolved_max_workers: int = 0
+    max_in_flight: int = 0
+    worker_pids: list = field(default_factory=list)
+    per_worker_task_count: dict = field(default_factory=dict)
+    per_worker_batch_count: dict = field(default_factory=dict)
+    per_worker_wall_seconds: dict = field(default_factory=dict)
+    batch_records: list = field(default_factory=list)
+    task_records: list = field(default_factory=list)
 
 
 @dataclass
@@ -61,6 +72,8 @@ class BatchResult:
     task_results: list
     worker_pid: int
     wall_seconds: float
+    predicted_cost: float = 0.0
+    task_ids: list = field(default_factory=list)
 
 
 def plan_batches(tasks: list, workers: int, batch_factor: int = 4) -> list:
@@ -86,20 +99,29 @@ def plan_batches(tasks: list, workers: int, batch_factor: int = 4) -> list:
 
 def execute_batch(batch: BatchRecord) -> BatchResult:
     """Execute all tasks in a batch sequentially. No nested pools/threads."""
-    import time as _time
-    pid = os.getpid()
+    import time as _time, os as _os
+    pid = _os.getpid()
     t0 = _time.perf_counter()
     results = []
     for record in batch.tasks:
+        t_task = _time.perf_counter()
         try:
             value = record.callable(*record.args)
-            results.append(TaskResult(task_id=record.task_id, value=value))
+            wall = _time.perf_counter() - t_task
+            results.append(TaskResult(task_id=record.task_id, value=value,
+                task_wall_seconds=wall, worker_pid=pid))
         except Exception as e:
+            wall = _time.perf_counter() - t_task
             results.append(TaskResult(
                 task_id=record.task_id,
                 error_type=type(e).__name__,
                 error_message=str(e),
-                exception=e
+                exception=e,
+                task_wall_seconds=wall,
+                worker_pid=pid
             ))
     wall = _time.perf_counter() - t0
-    return BatchResult(batch_id=batch.batch_id, task_results=results, worker_pid=pid, wall_seconds=wall)
+    task_ids = [r.task_id for r in results]
+    return BatchResult(batch_id=batch.batch_id, task_results=results,
+        worker_pid=pid, wall_seconds=wall, predicted_cost=batch.predicted_cost,
+        task_ids=task_ids)
