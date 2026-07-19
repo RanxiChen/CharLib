@@ -31,8 +31,8 @@ class TaskResult:
     error_type: Optional[str] = None
     error_message: Optional[str] = None
     exception: Optional[Exception] = None
-    task_wall_seconds: float = 0.0
-    worker_pid: int = 0
+    task_wall_seconds: Optional[float] = None
+    worker_pid: Optional[int] = None
     metrics: Optional['SchedulerMetrics'] = None
 
 
@@ -46,7 +46,8 @@ class SchedulerMetrics:
     collect_seconds: float = 0.0
     merge_seconds: float = 0.0
     ipc_estimate_bytes: int = 0
-    requested_jobs: int = 0
+    capture_metrics: bool = False
+    requested_jobs: Optional[int] = None
     resolved_max_workers: int = 0
     max_in_flight: int = 0
     worker_pids: list = field(default_factory=list)
@@ -70,8 +71,8 @@ class BatchResult:
     """Result of executing a batch."""
     batch_id: int
     task_results: list
-    worker_pid: int
-    wall_seconds: float
+    worker_pid: Optional[int] = None
+    wall_seconds: Optional[float] = None
     predicted_cost: float = 0.0
     task_ids: list = field(default_factory=list)
 
@@ -97,31 +98,48 @@ def plan_batches(tasks: list, workers: int, batch_factor: int = 4) -> list:
     return batches
 
 
-def execute_batch(batch: BatchRecord) -> BatchResult:
+def execute_batch(batch: BatchRecord, capture_metrics: bool = True) -> BatchResult:
     """Execute all tasks in a batch sequentially. No nested pools/threads."""
     import time as _time, os as _os
-    pid = _os.getpid()
-    t0 = _time.perf_counter()
+    pid = _os.getpid() if capture_metrics else None
+    t0 = _time.perf_counter() if capture_metrics else None
     results = []
     for record in batch.tasks:
-        t_task = _time.perf_counter()
+        if capture_metrics:
+            t_task = _time.perf_counter()
         try:
             value = record.callable(*record.args)
-            wall = _time.perf_counter() - t_task
-            results.append(TaskResult(task_id=record.task_id, value=value,
-                task_wall_seconds=wall, worker_pid=pid))
+            if capture_metrics:
+                wall = _time.perf_counter() - t_task
+                results.append(TaskResult(task_id=record.task_id, value=value,
+                    task_wall_seconds=wall, worker_pid=pid))
+            else:
+                results.append(TaskResult(task_id=record.task_id, value=value))
         except Exception as e:
-            wall = _time.perf_counter() - t_task
-            results.append(TaskResult(
-                task_id=record.task_id,
-                error_type=type(e).__name__,
-                error_message=str(e),
-                exception=e,
-                task_wall_seconds=wall,
-                worker_pid=pid
-            ))
-    wall = _time.perf_counter() - t0
-    task_ids = [r.task_id for r in results]
-    return BatchResult(batch_id=batch.batch_id, task_results=results,
-        worker_pid=pid, wall_seconds=wall, predicted_cost=batch.predicted_cost,
-        task_ids=task_ids)
+            if capture_metrics:
+                wall = _time.perf_counter() - t_task
+                results.append(TaskResult(
+                    task_id=record.task_id,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    exception=e,
+                    task_wall_seconds=wall,
+                    worker_pid=pid
+                ))
+            else:
+                results.append(TaskResult(
+                    task_id=record.task_id,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    exception=e,
+                ))
+    if capture_metrics:
+        wall = _time.perf_counter() - t0
+        task_ids = [r.task_id for r in results]
+        return BatchResult(batch_id=batch.batch_id, task_results=results,
+            worker_pid=pid, wall_seconds=wall, predicted_cost=batch.predicted_cost,
+            task_ids=task_ids)
+    else:
+        task_ids = [r.task_id for r in results]
+        return BatchResult(batch_id=batch.batch_id, task_results=results,
+            predicted_cost=batch.predicted_cost, task_ids=task_ids)

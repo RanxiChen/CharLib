@@ -37,6 +37,16 @@ def dummy_slow(x, duration=0.01):
     return Group('cell', f'cell_{x}')
 
 
+def make_group_task(name):
+    def task():
+        return Group('cell', name)
+    return task
+
+
+def make_cell_group(name):
+    return Group('cell', name)
+
+
 class TestTaskRecord:
     def test_stable_id(self):
         r = TaskRecord(task_id=5, callable=dummy_double, args=(3,), procedure="test.dummy_double")
@@ -392,7 +402,8 @@ class TestInterruptCleanup:
 
     def test_no_child_processes(self):
         from charlib.characterizer.characterizer import SchedulerMetrics as _SchedulerMetrics
-        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'}, jobs=2)
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'})
+        c.settings.jobs = 2
         records = [
             TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.01), procedure="t", cost_hint=1.0)
             for i in range(4)
@@ -466,7 +477,8 @@ class TestSignalInterruption:
         # Verify the SIGTERM handler guard allows _characterize_batched to run in a
         # non-main thread without failing on signal.signal.
         import threading
-        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'}, jobs=2)
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'})
+        c.settings.jobs = 2
         records = [
             TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.01), procedure="t", cost_hint=1.0)
             for i in range(4)
@@ -493,7 +505,8 @@ class TestSignalInterruption:
 
 class TestWorkerScaling:
     def _run_batched(self, jobs):
-        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'}, jobs=jobs)
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'})
+        c.settings.jobs = jobs
         records = [
             TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.01), procedure="t", cost_hint=1.0)
             for i in range(4)
@@ -574,7 +587,8 @@ class TestMetricsExtended:
         assert loaded["requested_jobs"] == 4
 
     def test_stable_sorting(self):
-        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'}, jobs=2)
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'})
+        c.settings.jobs = 2
         records = [
             TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.001), procedure="t", cost_hint=1.0)
             for i in range(4)
@@ -598,3 +612,243 @@ class TestMetricsExtended:
         m1.batch_records.append({"batch_id": 0})
         assert m2.worker_pids == []
         assert m2.batch_records == []
+
+
+class TestMetricsNullables:
+    def test_task_result_null_wall_pid(self):
+        r = TaskResult(task_id=0, value=42)
+        assert r.task_wall_seconds is None
+        assert r.worker_pid is None
+
+    def test_batch_result_null_wall_pid(self):
+        br = BatchResult(batch_id=0, task_results=[])
+        assert br.worker_pid is None
+        assert br.wall_seconds is None
+
+    def test_json_null_serialization(self):
+        br = BatchResult(batch_id=0, task_results=[], worker_pid=None, wall_seconds=None)
+        d = asdict(br)
+        assert d["worker_pid"] is None
+        assert d["wall_seconds"] is None
+        dumped = json.dumps(d)
+        loaded = json.loads(dumped)
+        assert loaded["worker_pid"] is None
+        assert loaded["wall_seconds"] is None
+
+
+class TestFutureFailure:
+    def test_synthetic_batch_on_future_failure(self):
+        # Directly exercise the synthetic BatchResult contract that
+        # _characterize_batched uses when a future fails at the pool level.
+        records = [
+            TaskRecord(task_id=0, callable=dummy_double, args=(3,), procedure="t", cost_hint=1.0, cell="c1"),
+            TaskRecord(task_id=1, callable=dummy_double, args=(4,), procedure="t", cost_hint=1.0, cell="c1"),
+        ]
+        task_ids = [t.task_id for t in records]
+        synthetic = BatchResult(
+            batch_id=7,
+            task_results=[
+                TaskResult(task_id=t.task_id, error_type='ProcessPoolFailure', error_message='pool broke')
+                for t in records
+            ],
+            worker_pid=None,
+            wall_seconds=None,
+            predicted_cost=2.0,
+            task_ids=task_ids,
+        )
+        assert synthetic.batch_id == 7
+        assert synthetic.worker_pid is None
+        assert synthetic.wall_seconds is None
+        assert synthetic.task_ids == task_ids
+        assert all(tr.error_type == 'ProcessPoolFailure' for tr in synthetic.task_results)
+
+
+class TestCellPropagation:
+    def test_task_records_show_both_cell_names(self):
+        c = Characterizer(
+            lib_name='test',
+            simulation={'execution_engine': 'batched'},
+            scheduler_metrics_path=None,
+        )
+
+        class DummyCell:
+            def __init__(self, name):
+                self.name = name
+
+        class DummyConfig:
+            pass
+
+        c.cells = [(DummyCell('cell_a'), DummyConfig()), (DummyCell('cell_b'), DummyConfig())]
+
+        from charlib.characterizer.characterizer import SchedulerMetrics
+        metrics = SchedulerMetrics()
+        captured_records = []
+
+        class _Bar:
+            def update(self, n):
+                pass
+
+        def mock_batched(records, progress_bar, metrics):
+            captured_records.extend(records)
+
+        c._characterize_batched = mock_batched
+        # Drive only the record-building part of characterize().
+        c.analyse_cell = lambda cell, config: [(make_group_task(cell.name),)]
+        try:
+            c.characterize()
+        except Exception:
+            pass
+
+        cells = {r.cell for r in captured_records}
+        assert cells == {'cell_a', 'cell_b'}
+
+
+class TestJobsSettings:
+    def test_jobs_set_via_settings_attribute(self):
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'})
+        c.settings.jobs = 2
+        records = [
+            TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.001), procedure="t", cost_hint=1.0)
+            for i in range(4)
+        ]
+        from charlib.characterizer.characterizer import SchedulerMetrics
+        metrics = SchedulerMetrics(task_count=4)
+
+        class _Bar:
+            def update(self, n):
+                pass
+
+        c._characterize_batched(records, _Bar(), metrics)
+        assert metrics.requested_jobs == 2
+        assert metrics.resolved_max_workers == 2
+        assert metrics.max_in_flight == c.settings.simulation.scheduler_max_inflight_per_worker * 2
+
+    def test_jobs_none_defaults_to_cpu_count(self):
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'})
+        assert c.settings.jobs is None
+        records = [
+            TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.001), procedure="t", cost_hint=1.0)
+            for i in range(4)
+        ]
+        from charlib.characterizer.characterizer import SchedulerMetrics
+        metrics = SchedulerMetrics(task_count=4)
+
+        class _Bar:
+            def update(self, n):
+                pass
+
+        c._characterize_batched(records, _Bar(), metrics)
+        assert metrics.requested_jobs is None
+        assert metrics.resolved_max_workers >= 1
+
+
+class TestOptInInstrumentation:
+    def test_capture_false_skips_instrumentation(self):
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'})
+        records = [
+            TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.001), procedure="t", cost_hint=1.0)
+            for i in range(4)
+        ]
+        from charlib.characterizer.characterizer import SchedulerMetrics
+        metrics = SchedulerMetrics(task_count=4)
+
+        class _Bar:
+            def update(self, n):
+                pass
+
+        c._characterize_batched(records, _Bar(), metrics)
+        assert metrics.capture_metrics is False
+        assert metrics.batch_records == []
+        assert metrics.task_records == []
+        assert metrics.worker_pids == []
+
+    def test_capture_true_populates_instrumentation(self):
+        with tempfile.TemporaryDirectory() as td:
+            metrics_path = os.path.join(td, 'metrics.json')
+            c = Characterizer(
+                lib_name='test',
+                simulation={'execution_engine': 'batched'},
+                scheduler_metrics_path=metrics_path,
+            )
+            records = [
+                TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.001), procedure="t", cost_hint=1.0)
+                for i in range(4)
+            ]
+            from charlib.characterizer.characterizer import SchedulerMetrics
+            metrics = SchedulerMetrics(task_count=4)
+
+            class _Bar:
+                def update(self, n):
+                    pass
+
+            c._characterize_batched(records, _Bar(), metrics)
+            assert metrics.capture_metrics is True
+            assert len(metrics.batch_records) > 0
+            assert len(metrics.task_records) == 4
+            assert len(metrics.worker_pids) > 0
+            assert all(t['wall_seconds'] is not None for t in metrics.task_records)
+
+
+class TestSingleMetricsWrite:
+    def test_one_json_written_after_merge(self):
+        with tempfile.TemporaryDirectory() as td:
+            metrics_path = os.path.join(td, 'metrics.json')
+            c = Characterizer(
+                lib_name='test',
+                simulation={'execution_engine': 'batched'},
+                scheduler_metrics_path=metrics_path,
+            )
+
+            class DummyCell:
+                def __init__(self, name):
+                    self.name = name
+
+            class DummyConfig:
+                plots = []
+
+            c.cells = [(DummyCell('cell_a'), DummyConfig())]
+            c.analyse_cell = lambda cell, config: [(make_cell_group, cell.name)]
+            c.characterize()
+
+            assert os.path.exists(metrics_path)
+            with open(metrics_path) as f:
+                data = json.load(f)
+            assert data['merge_seconds'] > 0
+
+
+class TestDeterministicSorting:
+    def test_batch_and_task_records_sorted(self):
+        with tempfile.TemporaryDirectory() as td:
+            metrics_path = os.path.join(td, 'metrics.json')
+            c = Characterizer(
+                lib_name='test',
+                simulation={'execution_engine': 'batched'},
+                scheduler_metrics_path=metrics_path,
+            )
+            records = [
+                TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.001), procedure="t", cost_hint=1.0)
+                for i in range(8)
+            ]
+            from charlib.characterizer.characterizer import SchedulerMetrics
+            metrics = SchedulerMetrics(task_count=8)
+
+            class _Bar:
+                def update(self, n):
+                    pass
+
+            c._characterize_batched(records, _Bar(), metrics)
+            assert metrics.batch_records == sorted(metrics.batch_records, key=lambda b: b['batch_id'])
+            assert metrics.task_records == sorted(metrics.task_records, key=lambda t: t['task_id'])
+            assert metrics.worker_pids == sorted(metrics.worker_pids)
+
+
+class TestNoSharedDefaults:
+    def test_two_scheduler_metrics_instances_independent(self):
+        m1 = SchedulerMetrics()
+        m2 = SchedulerMetrics()
+        m1.worker_pids.append(123)
+        m1.batch_records.append({"batch_id": 0})
+        m1.task_records.append({"task_id": 0})
+        assert m2.worker_pids == []
+        assert m2.batch_records == []
+        assert m2.task_records == []

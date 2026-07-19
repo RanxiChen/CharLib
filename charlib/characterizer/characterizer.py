@@ -1,19 +1,21 @@
 """Dispatches characterization jobs and manages cell data"""
 
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from dataclasses import asdict
 from pathlib import Path
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import time
 import os
 import signal
+import json
 
 from charlib.characterizer import utils, plots
 from charlib.characterizer.cell import Cell, CellTestConfig
 from charlib.characterizer.units import UnitsSettings
 from charlib.characterizer.procedures import registered_procedures, ProcedureFailedException
 from charlib.liberty.library import Library
-from charlib.characterizer.scheduler import TaskRecord, TaskResult, SchedulerMetrics, plan_batches, execute_batch
+from charlib.characterizer.scheduler import TaskRecord, TaskResult, SchedulerMetrics, BatchRecord, BatchResult, plan_batches, execute_batch
 
 import charlib.characterizer.procedures.pin_capacitance.ac_sweep
 import charlib.characterizer.procedures.pin_capacitance.charge_integration
@@ -125,6 +127,9 @@ class Characterizer:
 
         Activated when ``settings.simulation.execution_engine`` is ``batched``.
         """
+        capture = self.settings.scheduler_metrics_path is not None
+        metrics.capture_metrics = capture
+
         workers = self.settings.jobs or os.cpu_count() or 4
         batch_factor = self.settings.simulation.scheduler_batch_factor
         max_inflight_per_worker = self.settings.simulation.scheduler_max_inflight_per_worker
@@ -167,7 +172,7 @@ class Characterizer:
                     break
                 if interrupted:
                     break
-                fut = executor.submit(execute_batch, batch)
+                fut = executor.submit(execute_batch, batch, capture)
                 future_to_batch[fut] = batch
                 pending.add(fut)
 
@@ -192,19 +197,30 @@ class Characterizer:
                         # for every task in the batch so deterministic merge can report it.
                         if batch is not None:
                             progress_bar.update(len(batch.tasks))
-                            for record in batch.tasks:
-                                all_results.append(TaskResult(
-                                    task_id=record.task_id,
-                                    error_type=type(e).__name__,
+                            synthetic_results = [
+                                TaskResult(
+                                    task_id=t.task_id,
+                                    error_type='ProcessPoolFailure',
                                     error_message=str(e),
-                                ))
+                                )
+                                for t in batch.tasks
+                            ]
+                            all_results.extend(synthetic_results)
+                            all_batch_results.append(BatchResult(
+                                batch_id=batch.batch_id,
+                                task_results=synthetic_results,
+                                worker_pid=None,
+                                wall_seconds=None,
+                                predicted_cost=batch.predicted_cost,
+                                task_ids=[t.task_id for t in batch.tasks],
+                            ))
                 # Keep the pipeline full
                 while len(pending) < max_in_flight and not interrupted:
                     try:
                         batch = next(batch_iter)
                     except StopIteration:
                         break
-                    fut = executor.submit(execute_batch, batch)
+                    fut = executor.submit(execute_batch, batch, capture)
                     future_to_batch[fut] = batch
                     pending.add(fut)
 
@@ -240,51 +256,64 @@ class Characterizer:
                 f"Unfinished task IDs: {unfinished}"
             )
 
-        # Aggregate per-worker and per-batch metrics now that all batches finished.
-        worker_pids = sorted(set(r.worker_pid for r in all_batch_results))
-        per_worker_task_count = {str(pid): sum(len(r.task_results) for r in all_batch_results if r.worker_pid == pid) for pid in worker_pids}
-        per_worker_batch_count = {str(pid): sum(1 for r in all_batch_results if r.worker_pid == pid) for pid in worker_pids}
-        per_worker_wall_seconds = {str(pid): sum(r.wall_seconds for r in all_batch_results if r.worker_pid == pid) for pid in worker_pids}
-        batch_records = [
-            {
-                'batch_id': r.batch_id,
-                'worker_pid': r.worker_pid,
-                'wall_seconds': r.wall_seconds,
-                'predicted_cost': r.predicted_cost,
-                'task_count': len(r.task_results),
-                'task_ids': r.task_ids,
+        if capture:
+            # Aggregate per-worker and per-batch metrics in a single linear pass.
+            worker_pids = sorted({
+                r.worker_pid for r in all_batch_results
+                if r.worker_pid is not None
+            })
+            per_worker_task_count = {
+                str(pid): sum(
+                    len(r.task_results)
+                    for r in all_batch_results
+                    if r.worker_pid == pid
+                )
+                for pid in worker_pids
             }
-            for r in all_batch_results
-        ]
-        record_by_task_id = {record.task_id: record for record in records}
-        task_records = [
-            {
-                'task_id': tr.task_id,
-                'procedure': record_by_task_id[tr.task_id].procedure,
-                'cell': record_by_task_id[tr.task_id].cell,
-                'batch_id': r.batch_id,
-                'worker_pid': r.worker_pid,
-                'wall_seconds': tr.task_wall_seconds,
-                'error_type': tr.error_type,
+            per_worker_batch_count = {
+                str(pid): sum(
+                    1 for r in all_batch_results if r.worker_pid == pid
+                )
+                for pid in worker_pids
             }
-            for r in all_batch_results
-            for tr in r.task_results
-        ]
-        metrics.worker_pids = worker_pids
-        metrics.per_worker_task_count = per_worker_task_count
-        metrics.per_worker_batch_count = per_worker_batch_count
-        metrics.per_worker_wall_seconds = per_worker_wall_seconds
-        metrics.batch_records = sorted(batch_records, key=lambda b: b['batch_id'])
-        metrics.task_records = sorted(task_records, key=lambda t: t['task_id'])
-
-        metrics_path = getattr(self.settings, 'scheduler_metrics_path', None)
-        if metrics_path:
-            from dataclasses import asdict
-            import json
-            metrics_path = Path(metrics_path)
-            metrics_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(metrics_path, 'w') as f:
-                json.dump(asdict(metrics), f, sort_keys=True)
+            per_worker_wall_seconds = {
+                str(pid): sum(
+                    r.wall_seconds for r in all_batch_results
+                    if r.worker_pid == pid and r.wall_seconds is not None
+                )
+                for pid in worker_pids
+            }
+            batch_records = [
+                {
+                    'batch_id': r.batch_id,
+                    'worker_pid': r.worker_pid,
+                    'wall_seconds': r.wall_seconds,
+                    'predicted_cost': r.predicted_cost,
+                    'task_count': len(r.task_results),
+                    'task_ids': r.task_ids,
+                }
+                for r in all_batch_results
+            ]
+            record_by_task_id = {record.task_id: record for record in records}
+            task_records = [
+                {
+                    'task_id': tr.task_id,
+                    'procedure': record_by_task_id[tr.task_id].procedure,
+                    'cell': record_by_task_id[tr.task_id].cell,
+                    'batch_id': r.batch_id,
+                    'worker_pid': r.worker_pid,
+                    'wall_seconds': tr.task_wall_seconds,
+                    'error_type': tr.error_type,
+                }
+                for r in all_batch_results
+                for tr in r.task_results
+            ]
+            metrics.worker_pids = worker_pids
+            metrics.per_worker_task_count = per_worker_task_count
+            metrics.per_worker_batch_count = per_worker_batch_count
+            metrics.per_worker_wall_seconds = per_worker_wall_seconds
+            metrics.batch_records = sorted(batch_records, key=lambda b: b['batch_id'])
+            metrics.task_records = sorted(task_records, key=lambda t: t['task_id'])
 
         merge_start = time.perf_counter()
         self._apply_batched_results(
@@ -294,26 +323,31 @@ class Characterizer:
 
     def characterize(self):
         """Execute scheduled simulation jobs in parallel"""
-        # Setup: Prepare simulation jobs single-threadedly (is that a word?)
-        simulation_tasks = []
-        for (cell, config) in self.cells:
-            simulation_tasks += self.analyse_cell(cell, config)
-
         # Wrap raw tasks in TaskRecord objects for scheduler tracking
         records = []
-        for i, (task_fn, *task_args) in enumerate(simulation_tasks):
-            proc = f"{task_fn.__module__}.{task_fn.__qualname__}"
-            records.append(TaskRecord(task_id=i, callable=task_fn, args=tuple(task_args), procedure=proc))
+        task_index = 0
+        for (cell, config) in self.cells:
+            for (task_fn, *task_args) in self.analyse_cell(cell, config):
+                proc = f"{task_fn.__module__}.{task_fn.__qualname__}"
+                records.append(TaskRecord(
+                    task_id=task_index,
+                    callable=task_fn,
+                    args=tuple(task_args),
+                    procedure=proc,
+                    cell=cell.name,
+                ))
+                task_index += 1
 
         # Scheduler metrics are collected but not used to alter output in S1
         metrics = SchedulerMetrics(
-            task_count=len(simulation_tasks),
-            future_count=len(simulation_tasks),
+            task_count=len(records),
+            future_count=len(records),
         )
+        metrics.capture_metrics = self.settings.scheduler_metrics_path is not None
 
         # Run all simulation jobs and merge each resulting liberty cell group into the library
         with tqdm(bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-                  total=len(simulation_tasks), desc="Characterizing") as progress_bar:
+                  total=len(records), desc="Characterizing") as progress_bar:
             if self.settings.simulation.execution_engine == 'batched':
                 self._characterize_batched(records, progress_bar, metrics)
             else:
@@ -353,15 +387,12 @@ class Characterizer:
 
         liberty = self.library.to_liberty(precision=6)
 
-        # Optionally write scheduler metrics to an explicit artifact path, never into Liberty.
-        metrics_path = getattr(self.settings, 'scheduler_metrics_path', None)
-        if metrics_path:
-            from dataclasses import asdict
-            import json
-            metrics_path = Path(metrics_path)
+        # Write scheduler metrics once, after merge is complete.
+        if metrics.capture_metrics:
+            metrics_path = Path(self.settings.scheduler_metrics_path)
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
             with open(metrics_path, 'w') as f:
-                json.dump(asdict(metrics), f, sort_keys=True)
+                json.dump(asdict(metrics), f, indent=2, sort_keys=True)
 
         # Plot delay surfaces (if desired)
         for (cell, config) in self.cells:
