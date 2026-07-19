@@ -5,8 +5,10 @@ import json
 import signal
 import tempfile
 import multiprocessing
+import builtins
 from dataclasses import asdict
 from pathlib import Path
+from unittest import mock
 from concurrent.futures import ProcessPoolExecutor
 
 import pytest
@@ -164,7 +166,7 @@ class TestExecuteBatch:
             TaskRecord(task_id=1, callable=dummy_double, args=(4,), procedure="t", cost_hint=1.0),
         ]
         batch = BatchRecord(batch_id=7, tasks=records, predicted_cost=2.0)
-        result = execute_batch(batch)
+        result = execute_batch(batch, capture=True)
         assert result.batch_id == 7
         assert len(result.task_results) == 2
         assert result.task_results[0].value == 6
@@ -440,6 +442,7 @@ class TestMetricsSeparation:
                 simulation={'execution_engine': 'batched'},
                 scheduler_metrics_path=metrics_path,
             )
+            c.settings.jobs = 2
             liberty = c.characterize()
             assert os.path.exists(metrics_path)
             with open(metrics_path) as f:
@@ -522,11 +525,11 @@ class TestWorkerScaling:
         cells = list(c.library.subgroups_with_name('cell'))
         return sorted(g.identifier for g in cells)
 
-    def test_j1_equals_j8(self):
+    def test_j1_equals_j2(self):
         identifiers_j1 = self._run_batched(1)
-        identifiers_j8 = self._run_batched(8)
+        identifiers_j2 = self._run_batched(2)
         assert identifiers_j1 == ['cell_0', 'cell_1', 'cell_2', 'cell_3']
-        assert identifiers_j8 == identifiers_j1
+        assert identifiers_j2 == identifiers_j1
 
 
 class TestMetricsExtended:
@@ -536,7 +539,7 @@ class TestMetricsExtended:
             TaskRecord(task_id=1, callable=dummy_double, args=(4,), procedure="t", cost_hint=1.0),
         ]
         batch = BatchRecord(batch_id=7, tasks=records, predicted_cost=2.0)
-        result = execute_batch(batch)
+        result = execute_batch(batch, capture=True)
         assert result.worker_pid == os.getpid()
         assert all(r.worker_pid == result.worker_pid for r in result.task_results)
         assert all(r.task_wall_seconds >= 0.0 for r in result.task_results)
@@ -545,7 +548,7 @@ class TestMetricsExtended:
     def test_error_task_has_metrics(self):
         record = TaskRecord(task_id=5, callable=dummy_fail, args=(7,), procedure="t", cost_hint=1.0)
         batch = BatchRecord(batch_id=0, tasks=[record], predicted_cost=1.0)
-        result = execute_batch(batch)
+        result = execute_batch(batch, capture=True)
         tr = result.task_results[0]
         assert tr.task_wall_seconds >= 0.0
         assert tr.worker_pid > 0
@@ -737,14 +740,16 @@ class TestJobsSettings:
             def update(self, n):
                 pass
 
-        c._characterize_batched(records, _Bar(), metrics)
+        with mock.patch('os.cpu_count', return_value=2):
+            c._characterize_batched(records, _Bar(), metrics)
         assert metrics.requested_jobs is None
-        assert metrics.resolved_max_workers >= 1
+        assert metrics.resolved_max_workers == 2
 
 
 class TestOptInInstrumentation:
     def test_capture_false_skips_instrumentation(self):
         c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'})
+        c.settings.jobs = 2
         records = [
             TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.001), procedure="t", cost_hint=1.0)
             for i in range(4)
@@ -770,6 +775,7 @@ class TestOptInInstrumentation:
                 simulation={'execution_engine': 'batched'},
                 scheduler_metrics_path=metrics_path,
             )
+            c.settings.jobs = 2
             records = [
                 TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.001), procedure="t", cost_hint=1.0)
                 for i in range(4)
@@ -798,6 +804,7 @@ class TestSingleMetricsWrite:
                 simulation={'execution_engine': 'batched'},
                 scheduler_metrics_path=metrics_path,
             )
+            c.settings.jobs = 2
 
             class DummyCell:
                 def __init__(self, name):
@@ -825,6 +832,7 @@ class TestDeterministicSorting:
                 simulation={'execution_engine': 'batched'},
                 scheduler_metrics_path=metrics_path,
             )
+            c.settings.jobs = 2
             records = [
                 TaskRecord(task_id=i, callable=dummy_slow, args=(i, 0.001), procedure="t", cost_hint=1.0)
                 for i in range(8)
@@ -852,3 +860,299 @@ class TestNoSharedDefaults:
         assert m2.worker_pids == []
         assert m2.batch_records == []
         assert m2.task_records == []
+
+
+class _FakeExecutor:
+    """Synchronous stand-in for ProcessPoolExecutor; avoids forking workers."""
+
+    def __init__(self, max_workers=None):
+        pass
+
+    def submit(self, fn, *args, **kwargs):
+        from concurrent.futures import Future
+        fut = Future()
+        try:
+            fut.set_result(fn(*args, **kwargs))
+        except Exception as exc:
+            fut.set_exception(exc)
+        return fut
+
+    def shutdown(self, **kwargs):
+        pass
+
+
+class _DummyTqdm:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def update(self, n):
+        pass
+
+
+class _Bar:
+    def update(self, n):
+        pass
+
+
+class TestFix3HonestMetrics:
+    def test_future_exception_creates_synthetic_batch(self):
+        from concurrent.futures import Future
+
+        class FailingExecutor:
+            def __init__(self, max_workers=None):
+                pass
+
+            def submit(self, *args, **kwargs):
+                fut = Future()
+                fut.set_exception(RuntimeError("worker crash"))
+                return fut
+
+            def shutdown(self, **kwargs):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            metrics_path = os.path.join(td, 'metrics.json')
+            c = Characterizer(
+                lib_name='test',
+                simulation={'execution_engine': 'batched'},
+                scheduler_metrics_path=metrics_path,
+                omit_on_failure=True,
+            )
+            c.settings.jobs = 2
+            records = [
+                TaskRecord(
+                    task_id=0,
+                    callable=make_group_task('c0'),
+                    args=(),
+                    procedure='t',
+                    cost_hint=1.0,
+                    cell='c0',
+                )
+            ]
+            from charlib.characterizer.characterizer import SchedulerMetrics as _SchedulerMetrics
+            metrics = _SchedulerMetrics(task_count=1)
+
+            with mock.patch('charlib.characterizer.characterizer.ProcessPoolExecutor', FailingExecutor):
+                c._characterize_batched(records, _Bar(), metrics)
+
+            assert metrics.capture_metrics is True
+            assert len(metrics.batch_records) == 1
+            br = metrics.batch_records[0]
+            assert br['worker_pid'] is None
+            assert br['wall_seconds'] is None
+            assert br['task_count'] == 1
+            assert br['task_ids'] == [0]
+            assert len(metrics.task_records) == 1
+            assert metrics.task_records[0]['error_type'] == 'ProcessPoolFailure'
+            assert metrics.task_records[0]['task_id'] == 0
+
+    def test_disabled_metrics_no_perf_counter(self):
+        from charlib.characterizer import characterizer as char_mod
+        from charlib.characterizer import scheduler as sched_mod
+
+        perf_calls = [0]
+        pid_calls = [0]
+
+        def fail_perf():
+            perf_calls[0] += 1
+            raise AssertionError("perf_counter called when metrics disabled")
+
+        def fail_pid():
+            pid_calls[0] += 1
+            raise AssertionError("getpid called when metrics disabled")
+
+        c = Characterizer(lib_name='test', simulation={'execution_engine': 'batched'})
+        c.settings.jobs = 2
+        records = [
+            TaskRecord(
+                task_id=0,
+                callable=make_group_task('c0'),
+                args=(),
+                procedure='test.make_group_task',
+                cost_hint=1.0,
+            )
+        ]
+        from charlib.characterizer.characterizer import SchedulerMetrics as _SchedulerMetrics
+        metrics = _SchedulerMetrics(task_count=1)
+
+        with mock.patch.object(char_mod.time, 'perf_counter', fail_perf), \
+             mock.patch.object(char_mod.os, 'getpid', fail_pid), \
+             mock.patch('charlib.characterizer.characterizer.ProcessPoolExecutor', _FakeExecutor):
+            c._characterize_batched(records, _Bar(), metrics)
+
+        assert perf_calls[0] == 0
+        assert pid_calls[0] == 0
+        assert metrics.capture_metrics is False
+        assert metrics.submit_seconds == 0.0
+        assert metrics.collect_seconds == 0.0
+        assert metrics.merge_seconds == 0.0
+
+    def test_explicit_jobs_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            metrics_path = os.path.join(td, 'metrics.json')
+            c = Characterizer(
+                lib_name='test',
+                simulation={'execution_engine': 'batched'},
+                scheduler_metrics_path=metrics_path,
+            )
+            c.settings.jobs = 4
+
+            class DummyCell:
+                def __init__(self, name):
+                    self.name = name
+
+            class DummyConfig:
+                plots = []
+
+            c.cells = [(DummyCell('c1'), DummyConfig())]
+            c.analyse_cell = lambda cell, config: [(make_group_task(cell.name),)]
+
+            with mock.patch('charlib.characterizer.characterizer.ProcessPoolExecutor', _FakeExecutor), \
+                 mock.patch('charlib.characterizer.characterizer.tqdm', _DummyTqdm):
+                c.characterize()
+
+            with open(metrics_path) as f:
+                data = json.load(f)
+            assert data['requested_jobs'] == 4
+            assert data['resolved_max_workers'] == 4
+
+    def test_auto_jobs_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            metrics_path = os.path.join(td, 'metrics.json')
+            with mock.patch('os.cpu_count', return_value=6):
+                c = Characterizer(
+                    lib_name='test',
+                    simulation={'execution_engine': 'batched'},
+                    scheduler_metrics_path=metrics_path,
+                )
+
+                class DummyCell:
+                    def __init__(self, name):
+                        self.name = name
+
+                class DummyConfig:
+                    plots = []
+
+                c.cells = [(DummyCell('c1'), DummyConfig())]
+                c.analyse_cell = lambda cell, config: [(make_group_task(cell.name),)]
+
+                with mock.patch('charlib.characterizer.characterizer.ProcessPoolExecutor', _FakeExecutor), \
+                     mock.patch('charlib.characterizer.characterizer.tqdm', _DummyTqdm):
+                    c.characterize()
+
+            with open(metrics_path) as f:
+                data = json.load(f)
+            assert data['requested_jobs'] is None
+            assert data['resolved_max_workers'] == 6
+
+    def test_single_pass_aggregation(self):
+        records = [
+            TaskRecord(task_id=0, callable=None, args=(), procedure='p1', cell='c1'),
+            TaskRecord(task_id=1, callable=None, args=(), procedure='p2', cell='c2'),
+            TaskRecord(task_id=2, callable=None, args=(), procedure='p3', cell='c3'),
+        ]
+        br1 = BatchResult(
+            batch_id=0,
+            task_results=[
+                TaskResult(task_id=0, task_wall_seconds=0.1, worker_pid=100),
+                TaskResult(task_id=1, task_wall_seconds=0.2, worker_pid=100),
+            ],
+            worker_pid=100,
+            wall_seconds=0.35,
+            predicted_cost=1.0,
+            task_ids=[0, 1],
+        )
+        br2 = BatchResult(
+            batch_id=1,
+            task_results=[
+                TaskResult(task_id=2, task_wall_seconds=0.3, worker_pid=200),
+            ],
+            worker_pid=200,
+            wall_seconds=0.31,
+            predicted_cost=1.0,
+            task_ids=[2],
+        )
+        worker_pids, task_count, batch_count, wall, batch_records, task_records = Characterizer._aggregate_metrics(
+            [br1, br2], records
+        )
+        assert worker_pids == [100, 200]
+        assert task_count == {'100': 2, '200': 1}
+        assert batch_count == {'100': 1, '200': 1}
+        assert wall == {'100': pytest.approx(0.35), '200': pytest.approx(0.31)}
+        assert batch_records == sorted(batch_records, key=lambda b: b['batch_id'])
+        assert task_records == sorted(task_records, key=lambda t: t['task_id'])
+        assert len(task_records) == 3
+        assert {t['cell'] for t in task_records} == {'c1', 'c2', 'c3'}
+
+    def test_cell_propagation_to_metrics(self):
+        with tempfile.TemporaryDirectory() as td:
+            metrics_path = os.path.join(td, 'metrics.json')
+            c = Characterizer(
+                lib_name='test',
+                simulation={'execution_engine': 'batched'},
+                scheduler_metrics_path=metrics_path,
+            )
+            c.settings.jobs = 2
+
+            class DummyCell:
+                def __init__(self, name):
+                    self.name = name
+
+            class DummyConfig:
+                plots = []
+
+            c.cells = [(DummyCell('alpha'), DummyConfig()), (DummyCell('beta'), DummyConfig())]
+            c.analyse_cell = lambda cell, config: [(make_group_task(cell.name),)]
+
+            with mock.patch('charlib.characterizer.characterizer.ProcessPoolExecutor', _FakeExecutor), \
+                 mock.patch('charlib.characterizer.characterizer.tqdm', _DummyTqdm):
+                c.characterize()
+
+            with open(metrics_path) as f:
+                data = json.load(f)
+            cells = {t['cell'] for t in data['task_records']}
+            assert cells == {'alpha', 'beta'}
+            assert 'unknown' not in cells
+
+    def test_single_json_write(self):
+        write_count = [0]
+        orig_open = builtins.open
+
+        def counting_open(*args, **kwargs):
+            if 'metrics' in str(args[0]) and ('w' in args or kwargs.get('w')):
+                write_count[0] += 1
+            return orig_open(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as td:
+            metrics_path = os.path.join(td, 'metrics.json')
+            c = Characterizer(
+                lib_name='test',
+                simulation={'execution_engine': 'batched'},
+                scheduler_metrics_path=metrics_path,
+            )
+            c.settings.jobs = 2
+
+            class DummyCell:
+                def __init__(self, name):
+                    self.name = name
+
+            class DummyConfig:
+                plots = []
+
+            c.cells = [(DummyCell('c1'), DummyConfig())]
+            c.analyse_cell = lambda cell, config: [(make_group_task(cell.name),)]
+
+            with mock.patch('charlib.characterizer.characterizer.ProcessPoolExecutor', _FakeExecutor), \
+                 mock.patch('charlib.characterizer.characterizer.tqdm', _DummyTqdm), \
+                 mock.patch('builtins.open', counting_open):
+                c.characterize()
+
+            assert os.path.exists(metrics_path)
+
+        assert write_count[0] == 1

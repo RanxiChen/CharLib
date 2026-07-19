@@ -98,48 +98,72 @@ def plan_batches(tasks: list, workers: int, batch_factor: int = 4) -> list:
     return batches
 
 
-def execute_batch(batch: BatchRecord, capture_metrics: bool = True) -> BatchResult:
-    """Execute all tasks in a batch sequentially. No nested pools/threads."""
-    import time as _time, os as _os
-    pid = _os.getpid() if capture_metrics else None
-    t0 = _time.perf_counter() if capture_metrics else None
+def execute_batch(batch: BatchRecord, capture: bool = False) -> BatchResult:
+    """Execute all tasks in a batch sequentially. No nested pools/threads.
+
+    When ``capture`` is False, no timing or PID information is collected,
+    eliminating instrumentation overhead entirely.
+    """
+    if capture:
+        return _execute_batch_instrumented(batch)
+    return _execute_batch_fast(batch)
+
+
+def _execute_batch_fast(batch: BatchRecord) -> BatchResult:
+    """Execute a batch without any instrumentation overhead."""
     results = []
     for record in batch.tasks:
-        if capture_metrics:
-            t_task = _time.perf_counter()
         try:
             value = record.callable(*record.args)
-            if capture_metrics:
-                wall = _time.perf_counter() - t_task
-                results.append(TaskResult(task_id=record.task_id, value=value,
-                    task_wall_seconds=wall, worker_pid=pid))
-            else:
-                results.append(TaskResult(task_id=record.task_id, value=value))
+            results.append(TaskResult(task_id=record.task_id, value=value))
         except Exception as e:
-            if capture_metrics:
-                wall = _time.perf_counter() - t_task
-                results.append(TaskResult(
-                    task_id=record.task_id,
-                    error_type=type(e).__name__,
-                    error_message=str(e),
-                    exception=e,
-                    task_wall_seconds=wall,
-                    worker_pid=pid
-                ))
-            else:
-                results.append(TaskResult(
-                    task_id=record.task_id,
-                    error_type=type(e).__name__,
-                    error_message=str(e),
-                    exception=e,
-                ))
-    if capture_metrics:
-        wall = _time.perf_counter() - t0
-        task_ids = [r.task_id for r in results]
-        return BatchResult(batch_id=batch.batch_id, task_results=results,
-            worker_pid=pid, wall_seconds=wall, predicted_cost=batch.predicted_cost,
-            task_ids=task_ids)
-    else:
-        task_ids = [r.task_id for r in results]
-        return BatchResult(batch_id=batch.batch_id, task_results=results,
-            predicted_cost=batch.predicted_cost, task_ids=task_ids)
+            results.append(TaskResult(
+                task_id=record.task_id,
+                error_type=type(e).__name__,
+                error_message=str(e),
+                exception=e,
+            ))
+    return BatchResult(
+        batch_id=batch.batch_id,
+        task_results=results,
+        predicted_cost=batch.predicted_cost,
+        task_ids=[r.task_id for r in results],
+    )
+
+
+def _execute_batch_instrumented(batch: BatchRecord) -> BatchResult:
+    """Execute a batch while recording per-task and per-batch wall-clock times."""
+    import time as _time
+    pid = os.getpid()
+    t0 = _time.perf_counter()
+    results = []
+    for record in batch.tasks:
+        t_task = _time.perf_counter()
+        try:
+            value = record.callable(*record.args)
+            wall = _time.perf_counter() - t_task
+            results.append(TaskResult(
+                task_id=record.task_id,
+                value=value,
+                task_wall_seconds=wall,
+                worker_pid=pid,
+            ))
+        except Exception as e:
+            wall = _time.perf_counter() - t_task
+            results.append(TaskResult(
+                task_id=record.task_id,
+                error_type=type(e).__name__,
+                error_message=str(e),
+                exception=e,
+                task_wall_seconds=wall,
+                worker_pid=pid,
+            ))
+    wall = _time.perf_counter() - t0
+    return BatchResult(
+        batch_id=batch.batch_id,
+        task_results=results,
+        worker_pid=pid,
+        wall_seconds=wall,
+        predicted_cost=batch.predicted_cost,
+        task_ids=[r.task_id for r in results],
+    )

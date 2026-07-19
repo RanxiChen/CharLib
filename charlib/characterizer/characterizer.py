@@ -122,6 +122,63 @@ class Characterizer:
             for r in all_results:
                 self.library.add_group(r.value)
 
+    @staticmethod
+    def _aggregate_metrics(all_batch_results, records):
+        """Aggregate per-worker and per-batch metrics in a single linear pass."""
+        pid_task_count = {}
+        pid_batch_count = {}
+        pid_wall = {}
+        worker_pids = []
+        batch_records = []
+        task_records = []
+        record_by_task_id = {record.task_id: record for record in records}
+
+        for br in all_batch_results:
+            batch_records.append({
+                'batch_id': br.batch_id,
+                'worker_pid': br.worker_pid,
+                'wall_seconds': br.wall_seconds,
+                'predicted_cost': br.predicted_cost,
+                'task_count': len(br.task_results),
+                'task_ids': br.task_ids,
+            })
+            pid = br.worker_pid
+            if pid is not None:
+                pid_task_count[pid] = pid_task_count.get(pid, 0) + len(br.task_results)
+                pid_batch_count[pid] = pid_batch_count.get(pid, 0) + 1
+                if br.wall_seconds is not None:
+                    pid_wall[pid] = pid_wall.get(pid, 0.0) + br.wall_seconds
+                if pid not in worker_pids:
+                    worker_pids.append(pid)
+            for tr in br.task_results:
+                rec = record_by_task_id.get(tr.task_id)
+                if rec is None:
+                    continue
+                task_records.append({
+                    'task_id': tr.task_id,
+                    'batch_id': br.batch_id,
+                    'worker_pid': tr.worker_pid,
+                    'wall_seconds': tr.task_wall_seconds,
+                    'error_type': tr.error_type,
+                    'procedure': rec.procedure,
+                    'cell': rec.cell,
+                })
+
+        worker_pids.sort()
+        batch_records.sort(key=lambda b: b['batch_id'])
+        task_records.sort(key=lambda t: t['task_id'])
+        per_worker_task_count = {str(p): pid_task_count[p] for p in worker_pids}
+        per_worker_batch_count = {str(p): pid_batch_count[p] for p in worker_pids}
+        per_worker_wall_seconds = {str(p): pid_wall.get(p, 0.0) for p in worker_pids}
+        return (
+            worker_pids,
+            per_worker_task_count,
+            per_worker_batch_count,
+            per_worker_wall_seconds,
+            batch_records,
+            task_records,
+        )
+
     def _characterize_batched(self, records, progress_bar, metrics):
         """Execute TaskRecords using cost-ordered micro-batches.
 
@@ -138,7 +195,8 @@ class Characterizer:
         metrics.resolved_max_workers = workers
         metrics.max_in_flight = max_inflight_per_worker * workers
 
-        submit_start = time.perf_counter()
+        if capture:
+            submit_start = time.perf_counter()
         batches = plan_batches(records, workers, batch_factor=batch_factor)
         metrics.batch_count = len(batches)
         metrics.future_count = len(batches)
@@ -176,8 +234,9 @@ class Characterizer:
                 future_to_batch[fut] = batch
                 pending.add(fut)
 
-            metrics.submit_seconds = time.perf_counter() - submit_start
-            collect_start = time.perf_counter()
+            if capture:
+                metrics.submit_seconds = time.perf_counter() - submit_start
+                collect_start = time.perf_counter()
 
             while pending and not interrupted:
                 try:
@@ -224,7 +283,8 @@ class Characterizer:
                     future_to_batch[fut] = batch
                     pending.add(fut)
 
-            metrics.collect_seconds = time.perf_counter() - collect_start
+            if capture:
+                metrics.collect_seconds = time.perf_counter() - collect_start
         finally:
             if executor is not None:
                 if interrupted:
@@ -257,69 +317,22 @@ class Characterizer:
             )
 
         if capture:
-            # Aggregate per-worker and per-batch metrics in a single linear pass.
-            worker_pids = sorted({
-                r.worker_pid for r in all_batch_results
-                if r.worker_pid is not None
-            })
-            per_worker_task_count = {
-                str(pid): sum(
-                    len(r.task_results)
-                    for r in all_batch_results
-                    if r.worker_pid == pid
-                )
-                for pid in worker_pids
-            }
-            per_worker_batch_count = {
-                str(pid): sum(
-                    1 for r in all_batch_results if r.worker_pid == pid
-                )
-                for pid in worker_pids
-            }
-            per_worker_wall_seconds = {
-                str(pid): sum(
-                    r.wall_seconds for r in all_batch_results
-                    if r.worker_pid == pid and r.wall_seconds is not None
-                )
-                for pid in worker_pids
-            }
-            batch_records = [
-                {
-                    'batch_id': r.batch_id,
-                    'worker_pid': r.worker_pid,
-                    'wall_seconds': r.wall_seconds,
-                    'predicted_cost': r.predicted_cost,
-                    'task_count': len(r.task_results),
-                    'task_ids': r.task_ids,
-                }
-                for r in all_batch_results
-            ]
-            record_by_task_id = {record.task_id: record for record in records}
-            task_records = [
-                {
-                    'task_id': tr.task_id,
-                    'procedure': record_by_task_id[tr.task_id].procedure,
-                    'cell': record_by_task_id[tr.task_id].cell,
-                    'batch_id': r.batch_id,
-                    'worker_pid': r.worker_pid,
-                    'wall_seconds': tr.task_wall_seconds,
-                    'error_type': tr.error_type,
-                }
-                for r in all_batch_results
-                for tr in r.task_results
-            ]
-            metrics.worker_pids = worker_pids
-            metrics.per_worker_task_count = per_worker_task_count
-            metrics.per_worker_batch_count = per_worker_batch_count
-            metrics.per_worker_wall_seconds = per_worker_wall_seconds
-            metrics.batch_records = sorted(batch_records, key=lambda b: b['batch_id'])
-            metrics.task_records = sorted(task_records, key=lambda t: t['task_id'])
+            (
+                metrics.worker_pids,
+                metrics.per_worker_task_count,
+                metrics.per_worker_batch_count,
+                metrics.per_worker_wall_seconds,
+                metrics.batch_records,
+                metrics.task_records,
+            ) = self._aggregate_metrics(all_batch_results, records)
 
-        merge_start = time.perf_counter()
+        if capture:
+            merge_start = time.perf_counter()
         self._apply_batched_results(
             all_results, records, self.settings.omit_on_failure
         )
-        metrics.merge_seconds += time.perf_counter() - merge_start
+        if capture:
+            metrics.merge_seconds += time.perf_counter() - merge_start
 
     def characterize(self):
         """Execute scheduled simulation jobs in parallel"""
